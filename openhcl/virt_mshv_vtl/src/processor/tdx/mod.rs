@@ -3226,6 +3226,10 @@ impl<T: CpuIo> hv1_hypercall::RetargetDeviceInterrupt for UhHypercallHandler<'_,
         data: u32,
         params: &hv1_hypercall::HvInterruptParameters<'_>,
     ) -> hvdef::HvResult<()> {
+
+        // Register proxy vector for guest device interrupt
+        self.vp.partition.hcl.proxy_device_irr(params.vector);
+
         self.hcvm_retarget_interrupt(
             device_id,
             address,

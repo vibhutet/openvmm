@@ -361,6 +361,7 @@ mod ioctls {
     const MSHV_VTL_RMPQUERY: u16 = 0x35;
     const MSHV_INVLPGB: u16 = 0x36;
     const MSHV_TLBSYNC: u16 = 0x37;
+    const MSHV_REMAP_GUEST_INTERRUPT: u16 = 0x38;
 
     #[repr(C)]
     #[derive(Copy, Clone)]
@@ -575,7 +576,16 @@ mod ioctls {
         MSHV_IOCTL,
         MSHV_TLBSYNC
     );
+
+    ioctl_readwrite!(
+        /// Remap VTL0 device interrupt in VTL2.
+        hcl_remap_guest_interrupt,
+        MSHV_IOCTL,
+        MSHV_REMAP_GUEST_INTERRUPT,
+        u32
+    );
 }
+
 
 /// The `/dev/mshv_vtl_low` device for accessing VTL0 memory.
 pub struct MshvVtlLow {
@@ -3204,5 +3214,17 @@ impl Hcl {
         unsafe {
             hcl_tlbsync(self.mshv_vtl.file.as_raw_fd()).expect("should always succeed");
         }
+    }
+
+    /// Register a proxy vector for guest device interrupt
+    pub fn proxy_device_irr(&self, vector: u32) -> u32 {
+        let mut vector = vector; // Input VTL0 guest vector, output VTL2 vector
+
+        unsafe {
+            hcl_remap_guest_interrupt(self.mshv_vtl.file.as_raw_fd(), &mut vector)
+                .expect("should always succeed");
+        }
+
+        vector
     }
 }
