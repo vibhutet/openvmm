@@ -3261,8 +3261,15 @@ impl Hcl {
         Some(remaped_vector)
     }
 
-    /// Update vtl0 device interrupt map
-    pub fn set_device_irr_map(&self, remapped_vector: u8, target_vector: u8) {
+    /// Register a remapped proxy vector for vtl0 device interrupt and update mapping tables
+    pub fn register_new_device_irr(&self, target_vector: u8) -> u8 {
+        let mut remapped_vector = target_vector; // Input VTL0 guest vector, output VTL2 vector
+
+        unsafe {
+            hcl_remap_guest_interrupt(self.mshv_vtl.file.as_raw_fd(), &mut remapped_vector)
+                .expect("should always succeed");
+        }
+
         // update target(vtl0) to remaped(vtl2) vector mapping
         let device_irr_remapped_vector = unsafe { &*(addr_of!(self.device_irr_target_to_remapped_vector[target_vector as usize]).cast::<AtomicU8>()) };
         device_irr_remapped_vector.store(remapped_vector, Ordering::SeqCst);
@@ -3270,17 +3277,7 @@ impl Hcl {
         // update remapped(vtl2) to target(vtl0) vector mapping
         let device_irr_target_vector = unsafe { &*(addr_of!(self.device_irr_remapped_to_target_vector[remapped_vector as usize]).cast::<AtomicU8>()) };
         device_irr_target_vector.store(target_vector, Ordering::SeqCst);
-    }
 
-    /// Register a proxy vector for guest device interrupt
-    pub fn register_new_device_irr(&self, vector: u8) -> u8 {
-        let mut vector = vector; // Input VTL0 guest vector, output VTL2 vector
-
-        unsafe {
-            hcl_remap_guest_interrupt(self.mshv_vtl.file.as_raw_fd(), &mut vector)
-                .expect("should always succeed");
-        }
-
-        vector
+        remapped_vector
     }
 }
