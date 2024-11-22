@@ -3227,6 +3227,9 @@ impl<T: CpuIo> hv1_hypercall::RetargetDeviceInterrupt for UhHypercallHandler<'_,
         params: &hv1_hypercall::HvInterruptParameters<'_>,
     ) -> hvdef::HvResult<()> {
 
+        // TODO: Concurrent retarget hypercalls for same vector from multiple VPs can introduce a 
+        // race condition for callsto register_new_device_irr(). Do we need to handle this scenario?
+
         // Register proxy vector remapped in vtl2 for the guest device interrupt
         let remapped_vector = self.vp.partition.hcl.get_device_irr_map((params.vector & 0xff) as u8)
             .unwrap_or_else(|| {
