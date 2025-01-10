@@ -597,7 +597,8 @@ impl BackingPrivate for TdxBacked {
         //
         // Ideally we would disable this when `hide_isolation` is set, but
         // currently this is failing with `METADATA_FIELD_NOT_WRITABLE`.
-        let mut controls = TdxL2Ctls::new().with_enable_shared_ept(true);
+        let mut controls =
+            TdxL2Ctls::new().with_enable_shared_ept(!params.partition.hide_isolation);
 
         // If the synic is to be managed by the hypervisor, then enable TDVMCALLs.
         controls.set_enable_tdvmcall(
