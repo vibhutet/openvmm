@@ -594,9 +594,7 @@ impl BackingPrivate for TdxBacked {
         // when VTL 1 is enabled.
 
         // Configure L2 controls to permit shared memory.
-        //
-        // Ideally we would disable this when `hide_isolation` is set, but
-        // currently this is failing with `METADATA_FIELD_NOT_WRITABLE`.
+
         let mut controls =
             TdxL2Ctls::new().with_enable_shared_ept(!params.partition.hide_isolation);
 
