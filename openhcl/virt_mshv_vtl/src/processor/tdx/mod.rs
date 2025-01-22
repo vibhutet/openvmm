@@ -721,6 +721,8 @@ impl BackingPrivate for TdxBacked {
                     !0,
                     exception_bitmap,
                 );
+            } else {
+                return Err(super::Error::InvalidDebugConfiguration);
             }
         }
 
@@ -1891,7 +1893,7 @@ impl UhProcessor<'_, TdxBacked> {
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.tdcall
             }
             VmxExit::EXCEPTION => {
-                tracing::info!(
+                tracing::trace!(
                     "Caught Exception: {:?}",
                     exit_info._exit_interruption_info()
                 );

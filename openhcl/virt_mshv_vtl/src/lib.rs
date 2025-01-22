@@ -1389,10 +1389,10 @@ impl<'a> UhProtoPartition<'a> {
         let is_hardware_isolated = isolation.is_hardware_isolated();
 
         // Intercept Debug Exceptions
-        // TODO TDX: This currently works on TDX because all Underhill TDs today
-        // have the debug policy bit set, allowing the hypervisor to install the
-        // intercept on behalf of the guest. In the future, Underhill should
-        // register for these intercepts itself.
+        // On TDX because all OpenHCL TDs today have the debug policy bit set,
+        // OpenHCL registers for the intercepts itself.
+        // However, on non-TDX platforms hypervisor installs the
+        // intercept on behalf of the guest.
         if params.intercept_debug_exceptions {
             if !cfg!(feature = "gdb") {
                 return Err(Error::InvalidDebugConfiguration);
