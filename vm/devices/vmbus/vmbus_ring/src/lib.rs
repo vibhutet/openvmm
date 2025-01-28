@@ -96,7 +96,7 @@ mod protocol {
     /// A control page accessor.
     pub struct Control<'a>(pub &'a [AtomicU32; CONTROL_WORD_COUNT]);
 
-    impl<'a> Control<'a> {
+    impl Control<'_> {
         pub fn inp(&self) -> &AtomicU32 {
             &self.0[0]
         }
@@ -275,7 +275,7 @@ pub struct RingRangeReader<'a, T> {
     mem: &'a T,
 }
 
-impl<'a, T: RingMem> MemoryRead for RingRangeReader<'a, T> {
+impl<T: RingMem> MemoryRead for RingRangeReader<'_, T> {
     fn read(&mut self, data: &mut [u8]) -> Result<&mut Self, AccessError> {
         if self.len() < data.len() {
             return Err(AccessError::OutOfRange(self.len(), data.len()));
@@ -305,7 +305,7 @@ pub struct RingRangeWriter<'a, T> {
     mem: &'a T,
 }
 
-impl<'a, T: RingMem> MemoryWrite for RingRangeWriter<'a, T> {
+impl<T: RingMem> MemoryWrite for RingRangeWriter<'_, T> {
     fn write(&mut self, data: &[u8]) -> Result<(), AccessError> {
         if self.len() < data.len() {
             return Err(AccessError::OutOfRange(self.len(), data.len()));
@@ -315,7 +315,7 @@ impl<'a, T: RingMem> MemoryWrite for RingRangeWriter<'a, T> {
         Ok(())
     }
 
-    fn zero(&mut self, _len: usize) -> Result<(), AccessError> {
+    fn fill(&mut self, _val: u8, _len: usize) -> Result<(), AccessError> {
         unimplemented!()
     }
 
@@ -692,7 +692,7 @@ impl PacketSize {
         Self::in_band(payload_len)
     }
 
-    /// Computes the size of a gpa direct packet.
+    // Computes the size of a gpa direct packet.
     // pub fn gpa_direct()
 
     /// Computes the size of a transfer page packet.
@@ -1155,7 +1155,7 @@ pub fn inspect_ring<M: RingMem>(mem: M, req: inspect::Request<'_>) {
 /// Returns whether a ring buffer is in a state where the receiving end might
 /// need a signal.
 pub fn reader_needs_signal<M: RingMem>(mem: M) -> bool {
-    InnerRing::new(mem).map_or(false, |ring| {
+    InnerRing::new(mem).is_ok_and(|ring| {
         let control = ring.control();
         control.interrupt_mask().load(Ordering::Relaxed) == 0
             && (control.inp().load(Ordering::Relaxed) != control.outp().load(Ordering::Relaxed))
@@ -1165,7 +1165,7 @@ pub fn reader_needs_signal<M: RingMem>(mem: M) -> bool {
 /// Returns whether a ring buffer is in a state where the sending end might need
 /// a signal.
 pub fn writer_needs_signal<M: RingMem>(mem: M) -> bool {
-    InnerRing::new(mem).map_or(false, |ring| {
+    InnerRing::new(mem).is_ok_and(|ring| {
         let control = ring.control();
         let pending_size = control.pending_send_size().load(Ordering::Relaxed);
         pending_size != 0

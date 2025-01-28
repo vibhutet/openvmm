@@ -500,7 +500,7 @@ pub struct VpdMsftPagingExtentPropertiesPage {
     pub reserved: [u8; 2],
 }
 
-/// VPD Page 0xB2, Logical Block Provisioning
+// VPD Page 0xB2, Logical Block Provisioning
 
 pub const PROVISIONING_TYPE_UNKNOWN: u8 = 0x0;
 pub const PROVISIONING_TYPE_RESOURCE: u8 = 0x1;
@@ -713,6 +713,7 @@ pub const SCSI_SENSEQ_OPERATING_DEFINITION_CHANGED: u8 = 0x02;
 
 open_enum! {
     #[derive(AsBytes, FromBytes, FromZeroes)]
+    #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
     pub enum ScsiStatus: u8 {
         GOOD = 0x00,
         CHECK_CONDITION = 0x02,

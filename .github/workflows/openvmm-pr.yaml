@@ -6,7 +6,7 @@ name: '[flowey] OpenVMM PR'
 on:
   workflow_dispatch:
     inputs:
-      param0:
+      verbose:
         description: Run with verbose output
         default: false
         required: false
@@ -15,6 +15,11 @@ on:
     branches:
     - main
     - release/*
+    types:
+    - opened
+    - synchronize
+    - reopened
+    - ready_for_review
 concurrency:
   group: ${{ github.ref }}
   cancel-in-progress: true
@@ -25,6 +30,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -33,7 +39,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -43,7 +49,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -51,7 +57,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -104,8 +110,8 @@ jobs:
         echo '"debug"' | flowey v 0 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 0 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 0 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 0 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/guide"
         echo "$AgentTempDirNormal/publish_artifacts/guide" | flowey v 0 'artifact_publish_from_guide' --update-from-stdin --is-raw-string
@@ -214,6 +220,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -222,7 +229,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -232,7 +239,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -240,7 +247,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -293,8 +300,8 @@ jobs:
         echo '"debug"' | flowey.exe v 1 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 1 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 1 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 1 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-windows-rustdoc"
         echo "${{ runner.temp }}\\publish_artifacts\\x64-windows-rustdoc" | flowey.exe v 1 'artifact_publish_from_x64-windows-rustdoc' --update-from-stdin --is-raw-string
@@ -416,6 +423,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -424,7 +432,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -434,7 +442,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -442,7 +450,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -495,8 +503,8 @@ jobs:
         echo '"debug"' | flowey v 10 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 10 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 10 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 10 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-guest_test_uefi"
         echo "$AgentTempDirNormal/publish_artifacts/x64-guest_test_uefi" | flowey v 10 'artifact_publish_from_x64-guest_test_uefi' --update-from-stdin --is-raw-string
@@ -839,6 +847,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -847,7 +856,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -857,7 +866,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -865,7 +874,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -918,8 +927,8 @@ jobs:
         echo '"debug"' | flowey v 11 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 11 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 11 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 11 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/aarch64-linux-musl-pipette"
         echo "$AgentTempDirNormal/publish_artifacts/aarch64-linux-musl-pipette" | flowey v 11 'artifact_publish_from_aarch64-linux-musl-pipette' --update-from-stdin --is-raw-string
@@ -1046,7 +1055,7 @@ jobs:
     - name: report built openhcl_boot
       run: flowey e 11 flowey_lib_hvlite::build_openhcl_boot 0
       shell: bash
-    - name: unpack Microsoft.OHCL.Kernel.Dev.6.6.51.9-arm64.tar.gz
+    - name: unpack kernel package
       run: flowey e 11 flowey_lib_hvlite::download_openhcl_kernel_package 1
       shell: bash
     - name: 🌼 write_into Var
@@ -1136,7 +1145,7 @@ jobs:
     - name: 🌼 write_into Var
       run: flowey e 11 flowey_lib_hvlite::build_openhcl_igvm_from_recipe 6
       shell: bash
-    - name: unpack Microsoft.OHCL.Kernel.6.6.51.7-main-arm64.tar.gz
+    - name: unpack kernel package
       run: flowey e 11 flowey_lib_hvlite::download_openhcl_kernel_package 0
       shell: bash
     - name: building openhcl initrd
@@ -1253,6 +1262,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -1261,7 +1271,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -1271,7 +1281,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -1279,7 +1289,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -1332,8 +1342,8 @@ jobs:
         echo '"debug"' | flowey v 12 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 12 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 12 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 12 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-linux-musl-pipette"
         echo "$AgentTempDirNormal/publish_artifacts/x64-linux-musl-pipette" | flowey v 12 'artifact_publish_from_x64-linux-musl-pipette' --update-from-stdin --is-raw-string
@@ -1454,7 +1464,7 @@ jobs:
     - name: report built openhcl_boot
       run: flowey e 12 flowey_lib_hvlite::build_openhcl_boot 0
       shell: bash
-    - name: unpack Microsoft.OHCL.Kernel.Dev.6.6.51.9-x64.tar.gz
+    - name: unpack kernel package
       run: flowey e 12 flowey_lib_hvlite::download_openhcl_kernel_package 2
       shell: bash
     - name: 🌼 write_into Var
@@ -1550,7 +1560,7 @@ jobs:
     - name: 🌼 write_into Var
       run: flowey e 12 flowey_lib_hvlite::build_openhcl_igvm_from_recipe 39
       shell: bash
-    - name: unpack Microsoft.OHCL.Kernel.6.6.51.7-main-x64.tar.gz
+    - name: unpack kernel package
       run: flowey e 12 flowey_lib_hvlite::download_openhcl_kernel_package 0
       shell: bash
     - name: building openhcl initrd
@@ -1652,7 +1662,7 @@ jobs:
     - name: 🌼 write_into Var
       run: flowey e 12 flowey_lib_hvlite::_jobs::build_and_publish_openhcl_igvm_from_recipe 0
       shell: bash
-    - name: unpack Microsoft.OHCL.Kernel.6.6.51.7-main-cvm-x64.tar.gz
+    - name: unpack kernel package
       run: flowey e 12 flowey_lib_hvlite::download_openhcl_kernel_package 1
       shell: bash
     - name: 🌼 write_into Var
@@ -1839,6 +1849,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -1847,7 +1858,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -1857,7 +1868,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -1865,7 +1876,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -1918,8 +1929,8 @@ jobs:
         echo '"debug"' | flowey.exe v 13 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 13 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 13 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 13 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: install Rust
@@ -2163,6 +2174,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -2171,7 +2183,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -2181,7 +2193,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -2189,7 +2201,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -2242,8 +2254,8 @@ jobs:
         echo '"debug"' | flowey v 14 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 14 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 14 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 14 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: install Rust
@@ -2535,6 +2547,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -2543,7 +2556,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -2553,7 +2566,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -2561,7 +2574,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -2614,8 +2627,8 @@ jobs:
         echo '"debug"' | flowey v 15 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 15 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 15 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 15 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: install Rust
@@ -2905,6 +2918,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -2913,7 +2927,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -2923,7 +2937,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -2931,7 +2945,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -2984,8 +2998,8 @@ jobs:
         echo '"debug"' | flowey.exe v 16 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 16 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 16 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 16 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: report common cargo flags
@@ -3191,6 +3205,7 @@ jobs:
     - job8
     - job8
     - job8
+    if: github.event.pull_request.draft == false
     steps:
     - name: 🌼🥾 Download bootstrapped flowey
       uses: actions/download-artifact@v4
@@ -3241,8 +3256,8 @@ jobs:
         echo '"debug"' | flowey.exe v 17 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 17 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 17 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 17 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         echo "${{ runner.temp }}\\used_artifacts\\x64-guest_test_uefi" | flowey.exe v 17 'artifact_use_from_x64-guest_test_uefi' --update-from-stdin --is-raw-string
         echo "${{ runner.temp }}\\used_artifacts\\x64-linux-musl-pipette" | flowey.exe v 17 'artifact_use_from_x64-linux-musl-pipette' --update-from-stdin --is-raw-string
@@ -3346,6 +3361,9 @@ jobs:
       shell: bash
     - name: move MSVM.fd into its magic folder
       run: flowey.exe e 17 flowey_lib_hvlite::init_openvmm_magicpath_uefi_mu_msvm 0
+      shell: bash
+    - name: init hyperv tests
+      run: flowey.exe e 17 flowey_lib_hvlite::init_hyperv_tests 0
       shell: bash
     - name: 🌼 write_into Var
       run: flowey.exe e 17 flowey_lib_hvlite::run_cargo_nextest_run 0
@@ -3549,6 +3567,7 @@ jobs:
     - job8
     - job8
     - job8
+    if: github.event.pull_request.draft == false
     steps:
     - name: 🌼🥾 Download bootstrapped flowey
       uses: actions/download-artifact@v4
@@ -3599,8 +3618,8 @@ jobs:
         echo '"debug"' | flowey.exe v 18 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 18 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 18 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 18 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         echo "${{ runner.temp }}\\used_artifacts\\x64-guest_test_uefi" | flowey.exe v 18 'artifact_use_from_x64-guest_test_uefi' --update-from-stdin --is-raw-string
         echo "${{ runner.temp }}\\used_artifacts\\x64-linux-musl-pipette" | flowey.exe v 18 'artifact_use_from_x64-linux-musl-pipette' --update-from-stdin --is-raw-string
@@ -3704,6 +3723,9 @@ jobs:
       shell: bash
     - name: move MSVM.fd into its magic folder
       run: flowey.exe e 18 flowey_lib_hvlite::init_openvmm_magicpath_uefi_mu_msvm 0
+      shell: bash
+    - name: init hyperv tests
+      run: flowey.exe e 18 flowey_lib_hvlite::init_hyperv_tests 0
       shell: bash
     - name: 🌼 write_into Var
       run: flowey.exe e 18 flowey_lib_hvlite::run_cargo_nextest_run 0
@@ -3906,6 +3928,7 @@ jobs:
     - job10
     - job8
     - job10
+    if: github.event.pull_request.draft == false
     steps:
     - name: 🌼🥾 Download bootstrapped flowey
       uses: actions/download-artifact@v4
@@ -3951,8 +3974,8 @@ jobs:
         echo '"debug"' | flowey v 19 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 19 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 19 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 19 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         echo "$AgentTempDirNormal/used_artifacts/x64-guest_test_uefi" | flowey v 19 'artifact_use_from_x64-guest_test_uefi' --update-from-stdin --is-raw-string
         echo "$AgentTempDirNormal/used_artifacts/x64-linux-musl-pipette" | flowey v 19 'artifact_use_from_x64-linux-musl-pipette' --update-from-stdin --is-raw-string
@@ -4257,6 +4280,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -4265,7 +4289,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -4275,7 +4299,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -4283,7 +4307,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -4336,8 +4360,8 @@ jobs:
         echo '"debug"' | flowey v 2 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 2 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 2 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 2 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-linux-rustdoc"
         echo "$AgentTempDirNormal/publish_artifacts/x64-linux-rustdoc" | flowey v 2 'artifact_publish_from_x64-linux-rustdoc' --update-from-stdin --is-raw-string
@@ -4473,12 +4497,63 @@ jobs:
     - job6
     - job6
     - job6
+    if: github.event.pull_request.draft == false
     steps:
-    - name: 🌼🥾 Download bootstrapped flowey
-      uses: actions/download-artifact@v4
+    - run: echo "injected!"
+      name: 🌼🥾 Bootstrap flowey
+      shell: bash
+    - run: |
+        set -x
+        i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
+        sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
+        . "$HOME/.cargo/env"
+        echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+        rustup show
+      if: runner.os == 'Linux'
+      name: rustup (Linux)
+      shell: bash
+    - run: |
+        set -x
+        curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
+        ./rustup-init.exe -y --default-toolchain=1.84.0
+        echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
+      if: runner.os == 'Windows' && runner.arch == 'X64'
+      name: rustup (Windows X64)
+      shell: bash
+    - run: |
+        set -x
+        curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
+        ./rustup-init.exe -y --default-toolchain=1.84.0
+        echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
+      if: runner.os == 'Windows' && runner.arch == 'ARM64'
+      name: rustup (Windows ARM64)
+      shell: bash
+    - uses: actions/checkout@v4
       with:
-        name: _internal-flowey-bootstrap-x86_64-windows-uid-12
-        path: ${{ runner.temp }}/bootstrapped-flowey
+        path: flowey_bootstrap
+    - name: Build flowey
+      run: CARGO_INCREMENTAL=0 RUSTC_BOOTSTRAP=1 RUSTFLAGS="-Z threads=8" cargo build -p flowey_hvlite --target aarch64-pc-windows-msvc --profile flowey-ci
+      working-directory: flowey_bootstrap
+      shell: bash
+    - name: Stage flowey artifact
+      run: |
+        mkdir ./flowey_bootstrap_temp
+        mv ./.github/workflows/openvmm-pr.yaml ./flowey_bootstrap_temp/pipeline.yaml
+        mv target/aarch64-pc-windows-msvc/flowey-ci/flowey_hvlite.exe ./flowey_bootstrap_temp/flowey.exe
+      working-directory: flowey_bootstrap
+      shell: bash
+    - name: Copy flowey artifact
+      run: |
+        OutDirNormal=$(echo "${{ runner.temp }}/bootstrapped-flowey" | sed -e 's|\\|\/|g' -e 's|^\([A-Za-z]\)\:/\(.*\)|/\L\1\E/\2|')
+        mkdir -p $OutDirNormal
+        cp -r ./flowey_bootstrap_temp/* $OutDirNormal
+      working-directory: flowey_bootstrap
+      shell: bash
+    - name: Cleanup staged flowey artifact
+      run: rm -rf ./flowey_bootstrap_temp
+      working-directory: flowey_bootstrap
+      shell: bash
     - name: 🌼📦 Download aarch64-guest_test_uefi
       uses: actions/download-artifact@v4
       with:
@@ -4512,6 +4587,15 @@ jobs:
     - run: echo "${{ runner.temp }}/bootstrapped-flowey" >> $GITHUB_PATH
       shell: bash
       name: 🌼📦 Add flowey to PATH
+    - name: 🌼🔎 Self-check YAML
+      run: |-
+        ESCAPED_AGENT_TEMPDIR=$(
+        cat <<'EOF' | sed 's/\\/\\\\/g'
+        ${{ runner.temp }}
+        EOF
+        )
+        flowey.exe pipeline github --runtime $ESCAPED_AGENT_TEMPDIR\\bootstrapped-flowey\\pipeline.yaml --out .github/workflows/openvmm-pr.yaml ci checkin-gates --config=pr
+      shell: bash
     - name: 🌼🛫 Initialize job
       run: |
         AgentTempDirNormal="${{ runner.temp }}"
@@ -4523,8 +4607,8 @@ jobs:
         echo '"debug"' | flowey.exe v 20 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 20 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 20 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 20 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         echo "${{ runner.temp }}\\used_artifacts\\aarch64-guest_test_uefi" | flowey.exe v 20 'artifact_use_from_aarch64-guest_test_uefi' --update-from-stdin --is-raw-string
         echo "${{ runner.temp }}\\used_artifacts\\aarch64-linux-musl-pipette" | flowey.exe v 20 'artifact_use_from_aarch64-linux-musl-pipette' --update-from-stdin --is-raw-string
@@ -4628,6 +4712,9 @@ jobs:
       shell: bash
     - name: move MSVM.fd into its magic folder
       run: flowey.exe e 20 flowey_lib_hvlite::init_openvmm_magicpath_uefi_mu_msvm 0
+      shell: bash
+    - name: init hyperv tests
+      run: flowey.exe e 20 flowey_lib_hvlite::init_hyperv_tests 0
       shell: bash
     - name: 🌼 write_into Var
       run: flowey.exe e 20 flowey_lib_hvlite::run_cargo_nextest_run 0
@@ -4824,6 +4911,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -4832,7 +4920,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -4842,7 +4930,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -4850,7 +4938,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -4903,8 +4991,8 @@ jobs:
         echo '"debug"' | flowey v 21 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 21 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 21 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 21 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: check if hvlite needs to be cloned
@@ -4974,7 +5062,7 @@ jobs:
     - job2
     - job1
     - job0
-    if: ${{ always() }}
+    if: always() && github.event.pull_request.draft == false
     env:
       ANY_JOBS_FAILED: ${{ contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'failure') }}
     steps:
@@ -4997,8 +5085,8 @@ jobs:
         echo '"debug"' | flowey v 22 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 22 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 22 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 22 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: Check if any jobs failed
@@ -5012,6 +5100,7 @@ jobs:
       id-token: write
     needs:
     - job4
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -5020,7 +5109,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -5030,7 +5119,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -5038,7 +5127,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -5091,8 +5180,8 @@ jobs:
         echo '"debug"' | flowey.exe v 3 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 3 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 3 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 3 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: check if hvlite needs to be cloned
@@ -5201,6 +5290,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -5209,7 +5299,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -5219,7 +5309,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -5227,7 +5317,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -5280,8 +5370,8 @@ jobs:
         echo '"debug"' | flowey v 4 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 4 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 4 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 4 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
       shell: bash
     - name: check if hvlite needs to be cloned
@@ -5401,6 +5491,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -5409,7 +5500,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -5419,7 +5510,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -5427,7 +5518,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -5480,9 +5571,11 @@ jobs:
         echo '"debug"' | flowey.exe v 5 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 5 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 5 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 5 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
+        mkdir -p "$AgentTempDirNormal/publish_artifacts/aarch64-windows-hypestv"
+        echo "${{ runner.temp }}\\publish_artifacts\\aarch64-windows-hypestv" | flowey.exe v 5 'artifact_publish_from_aarch64-windows-hypestv' --update-from-stdin --is-raw-string
         mkdir -p "$AgentTempDirNormal/publish_artifacts/aarch64-windows-igvmfilegen"
         echo "${{ runner.temp }}\\publish_artifacts\\aarch64-windows-igvmfilegen" | flowey.exe v 5 'artifact_publish_from_aarch64-windows-igvmfilegen' --update-from-stdin --is-raw-string
         mkdir -p "$AgentTempDirNormal/publish_artifacts/aarch64-windows-ohcldiag-dev"
@@ -5572,13 +5665,31 @@ jobs:
       run: flowey.exe e 5 flowey_lib_hvlite::init_openvmm_magicpath_protoc 0
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 0
+      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 4
       shell: bash
-    - name: cargo build vmgstool
-      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 3
+    - name: cargo build ohcldiag-dev
+      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 2
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 3
+      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 2
+      shell: bash
+    - name: report built ohcldiag_dev
+      run: flowey.exe e 5 flowey_lib_hvlite::build_ohcldiag_dev 0
+      shell: bash
+    - name: 🌼 write_into Var
+      run: flowey.exe e 5 flowey_lib_hvlite::artifact_ohcldiag_dev::publish 0
+      shell: bash
+    - name: copying ohcldiag-dev to artifact dir
+      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 2
+      shell: bash
+    - name: inject cross env
+      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 1
+      shell: bash
+    - name: cargo build vmgstool
+      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 4
+      shell: bash
+    - name: 🌼 write_into Var
+      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 4
       shell: bash
     - name: report built vmgstool
       run: flowey.exe e 5 flowey_lib_hvlite::build_vmgstool 0
@@ -5587,16 +5698,34 @@ jobs:
       run: flowey.exe e 5 flowey_lib_hvlite::artifact_vmgstool::publish 0
       shell: bash
     - name: copying vmgstool to artifact dir
-      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 3
+      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 4
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 3
+      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 2
       shell: bash
-    - name: cargo build vmgs_lib
-      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 2
+    - name: cargo build hypestv
+      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 0
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 2
+      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 0
+      shell: bash
+    - name: report built hypestv
+      run: flowey.exe e 5 flowey_lib_hvlite::build_hypestv 0
+      shell: bash
+    - name: 🌼 write_into Var
+      run: flowey.exe e 5 flowey_lib_hvlite::artifact_hypestv::publish 0
+      shell: bash
+    - name: copying hypestv to artifact dir
+      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 0
+      shell: bash
+    - name: inject cross env
+      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 0
+      shell: bash
+    - name: cargo build vmgs_lib
+      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 3
+      shell: bash
+    - name: 🌼 write_into Var
+      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 3
       shell: bash
     - name: check built vmgs_lib
       run: flowey.exe e 5 flowey_lib_hvlite::build_and_test_vmgs_lib 0
@@ -5608,16 +5737,16 @@ jobs:
       run: flowey.exe e 5 flowey_lib_hvlite::artifact_vmgs_lib::publish 0
       shell: bash
     - name: copying vmgs_lib to artifact dir
-      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 2
+      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 3
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 1
+      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 3
       shell: bash
     - name: cargo build igvmfilegen
-      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 0
+      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 1
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 0
+      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 1
       shell: bash
     - name: report built igvmfilegen
       run: flowey.exe e 5 flowey_lib_hvlite::build_igvmfilegen 0
@@ -5626,29 +5755,16 @@ jobs:
       run: flowey.exe e 5 flowey_lib_hvlite::artifact_igvmfilegen::publish 0
       shell: bash
     - name: copying igvmfilegen to artifact dir
-      run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 0
-      shell: bash
-    - name: inject cross env
-      run: flowey.exe e 5 flowey_lib_hvlite::init_cross_build 2
-      shell: bash
-    - name: cargo build ohcldiag-dev
-      run: flowey.exe e 5 flowey_lib_common::run_cargo_build 1
-      shell: bash
-    - name: 🌼 write_into Var
-      run: flowey.exe e 5 flowey_lib_hvlite::run_cargo_build 1
-      shell: bash
-    - name: report built ohcldiag_dev
-      run: flowey.exe e 5 flowey_lib_hvlite::build_ohcldiag_dev 0
-      shell: bash
-    - name: 🌼 write_into Var
-      run: flowey.exe e 5 flowey_lib_hvlite::artifact_ohcldiag_dev::publish 0
-      shell: bash
-    - name: copying ohcldiag-dev to artifact dir
       run: flowey.exe e 5 flowey_lib_common::copy_to_artifact_dir 1
       shell: bash
     - name: 'validate cache entry: gh-release-download'
       run: flowey.exe e 5 flowey_lib_common::cache 3
       shell: bash
+    - name: 🌼📦 Publish aarch64-windows-hypestv
+      uses: actions/upload-artifact@v4
+      with:
+        name: aarch64-windows-hypestv
+        path: ${{ runner.temp }}/publish_artifacts/aarch64-windows-hypestv/
     - name: 🌼📦 Publish aarch64-windows-igvmfilegen
       uses: actions/upload-artifact@v4
       with:
@@ -5675,6 +5791,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -5683,7 +5800,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -5693,7 +5810,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -5701,7 +5818,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -5754,8 +5871,8 @@ jobs:
         echo '"debug"' | flowey.exe v 6 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 6 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 6 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 6 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/aarch64-windows-openvmm"
         echo "${{ runner.temp }}\\publish_artifacts\\aarch64-windows-openvmm" | flowey.exe v 6 'artifact_publish_from_aarch64-windows-openvmm' --update-from-stdin --is-raw-string
@@ -5953,14 +6070,6 @@ jobs:
       with:
         name: aarch64-windows-vmm-tests-archive
         path: ${{ runner.temp }}/publish_artifacts/aarch64-windows-vmm-tests-archive/
-    - name: 🌼🧼 Redact bootstrap var db
-      run: rm $AgentTempDirNormal/bootstrapped-flowey/job6.json
-      shell: bash
-    - name: 🌼🥾 Publish bootstrapped flowey
-      uses: actions/upload-artifact@v4
-      with:
-        name: _internal-flowey-bootstrap-x86_64-windows-uid-12
-        path: ${{ runner.temp }}/bootstrapped-flowey
   job7:
     name: build artifacts (not for VMM tests) [x64-windows]
     runs-on:
@@ -5969,6 +6078,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -5977,7 +6087,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -5987,7 +6097,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -5995,7 +6105,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -6048,9 +6158,11 @@ jobs:
         echo '"debug"' | flowey.exe v 7 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 7 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 7 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 7 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
+        mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-windows-hypestv"
+        echo "${{ runner.temp }}\\publish_artifacts\\x64-windows-hypestv" | flowey.exe v 7 'artifact_publish_from_x64-windows-hypestv' --update-from-stdin --is-raw-string
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-windows-igvmfilegen"
         echo "${{ runner.temp }}\\publish_artifacts\\x64-windows-igvmfilegen" | flowey.exe v 7 'artifact_publish_from_x64-windows-igvmfilegen' --update-from-stdin --is-raw-string
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-windows-ohcldiag-dev"
@@ -6140,13 +6252,13 @@ jobs:
       run: flowey.exe e 7 flowey_lib_hvlite::init_openvmm_magicpath_protoc 0
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 0
+      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 1
       shell: bash
     - name: cargo build vmgstool
-      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 3
+      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 4
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 3
+      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 4
       shell: bash
     - name: report built vmgstool
       run: flowey.exe e 7 flowey_lib_hvlite::build_vmgstool 0
@@ -6155,16 +6267,34 @@ jobs:
       run: flowey.exe e 7 flowey_lib_hvlite::artifact_vmgstool::publish 0
       shell: bash
     - name: copying vmgstool to artifact dir
-      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 3
+      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 4
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 3
+      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 2
       shell: bash
-    - name: cargo build vmgs_lib
-      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 2
+    - name: cargo build hypestv
+      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 0
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 2
+      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 0
+      shell: bash
+    - name: report built hypestv
+      run: flowey.exe e 7 flowey_lib_hvlite::build_hypestv 0
+      shell: bash
+    - name: 🌼 write_into Var
+      run: flowey.exe e 7 flowey_lib_hvlite::artifact_hypestv::publish 0
+      shell: bash
+    - name: copying hypestv to artifact dir
+      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 0
+      shell: bash
+    - name: inject cross env
+      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 0
+      shell: bash
+    - name: cargo build vmgs_lib
+      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 3
+      shell: bash
+    - name: 🌼 write_into Var
+      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 3
       shell: bash
     - name: check built vmgs_lib
       run: flowey.exe e 7 flowey_lib_hvlite::build_and_test_vmgs_lib 0
@@ -6179,16 +6309,16 @@ jobs:
       run: flowey.exe e 7 flowey_lib_hvlite::artifact_vmgs_lib::publish 0
       shell: bash
     - name: copying vmgs_lib to artifact dir
-      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 2
+      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 3
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 1
+      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 3
       shell: bash
     - name: cargo build igvmfilegen
-      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 0
+      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 1
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 0
+      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 1
       shell: bash
     - name: report built igvmfilegen
       run: flowey.exe e 7 flowey_lib_hvlite::build_igvmfilegen 0
@@ -6197,16 +6327,16 @@ jobs:
       run: flowey.exe e 7 flowey_lib_hvlite::artifact_igvmfilegen::publish 0
       shell: bash
     - name: copying igvmfilegen to artifact dir
-      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 0
+      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 1
       shell: bash
     - name: inject cross env
-      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 2
+      run: flowey.exe e 7 flowey_lib_hvlite::init_cross_build 4
       shell: bash
     - name: cargo build ohcldiag-dev
-      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 1
+      run: flowey.exe e 7 flowey_lib_common::run_cargo_build 2
       shell: bash
     - name: 🌼 write_into Var
-      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 1
+      run: flowey.exe e 7 flowey_lib_hvlite::run_cargo_build 2
       shell: bash
     - name: report built ohcldiag_dev
       run: flowey.exe e 7 flowey_lib_hvlite::build_ohcldiag_dev 0
@@ -6215,11 +6345,16 @@ jobs:
       run: flowey.exe e 7 flowey_lib_hvlite::artifact_ohcldiag_dev::publish 0
       shell: bash
     - name: copying ohcldiag-dev to artifact dir
-      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 1
+      run: flowey.exe e 7 flowey_lib_common::copy_to_artifact_dir 2
       shell: bash
     - name: 'validate cache entry: gh-release-download'
       run: flowey.exe e 7 flowey_lib_common::cache 3
       shell: bash
+    - name: 🌼📦 Publish x64-windows-hypestv
+      uses: actions/upload-artifact@v4
+      with:
+        name: x64-windows-hypestv
+        path: ${{ runner.temp }}/publish_artifacts/x64-windows-hypestv/
     - name: 🌼📦 Publish x64-windows-igvmfilegen
       uses: actions/upload-artifact@v4
       with:
@@ -6246,6 +6381,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -6254,7 +6390,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -6264,7 +6400,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -6272,7 +6408,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -6325,8 +6461,8 @@ jobs:
         echo '"debug"' | flowey.exe v 8 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey.exe v 8 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey.exe v 8 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey.exe v 8 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/x64-windows-openvmm"
         echo "${{ runner.temp }}\\publish_artifacts\\x64-windows-openvmm" | flowey.exe v 8 'artifact_publish_from_x64-windows-openvmm' --update-from-stdin --is-raw-string
@@ -6541,6 +6677,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+    if: github.event.pull_request.draft == false
     steps:
     - run: echo "injected!"
       name: 🌼🥾 Bootstrap flowey
@@ -6549,7 +6686,7 @@ jobs:
         set -x
         i=0; while [ $i -lt 5 ] && ! sudo apt-get update; do let "i=i+1"; sleep 1; done;
         sudo apt-get -o DPkg::Lock::Timeout=60 install gcc -y
-        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.82.0 -y
+        curl --fail --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- --default-toolchain=1.84.0 -y
         . "$HOME/.cargo/env"
         echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
         rustup show
@@ -6559,7 +6696,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/x86_64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'X64'
       name: rustup (Windows X64)
@@ -6567,7 +6704,7 @@ jobs:
     - run: |
         set -x
         curl --fail -sSfLo rustup-init.exe https://win.rustup.rs/aarch64 --output rustup-init
-        ./rustup-init.exe -y --default-toolchain=1.82.0
+        ./rustup-init.exe -y --default-toolchain=1.84.0
         echo "$USERPROFILE\\.cargo\\bin" >> $GITHUB_PATH
       if: runner.os == 'Windows' && runner.arch == 'ARM64'
       name: rustup (Windows ARM64)
@@ -6620,8 +6757,8 @@ jobs:
         echo '"debug"' | flowey v 9 'FLOWEY_LOG' --update-from-stdin
         echo "${{ runner.temp }}/work" | flowey v 9 '_internal_WORKING_DIR' --update-from-stdin --is-raw-string
 
-        cat <<'EOF' | flowey v 9 'param0' --update-from-stdin
-        ${{ inputs.param0 != '' && inputs.param0 || 'false' }}
+        cat <<'EOF' | flowey v 9 'verbose' --update-from-stdin
+        ${{ inputs.verbose != '' && inputs.verbose || 'false' }}
         EOF
         mkdir -p "$AgentTempDirNormal/publish_artifacts/aarch64-guest_test_uefi"
         echo "$AgentTempDirNormal/publish_artifacts/aarch64-guest_test_uefi" | flowey v 9 'artifact_publish_from_aarch64-guest_test_uefi' --update-from-stdin --is-raw-string

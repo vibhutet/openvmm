@@ -3,7 +3,7 @@
 
 [package]
 name = "disk_file"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -15,7 +15,7 @@ vm_resource.workspace = true
 
 inspect = { workspace = true, features = ["filepath"] }
 blocking.workspace = true
-stackfuture.workspace = true
+thiserror.workspace = true
 
 [lints]
 workspace = true

@@ -11,9 +11,10 @@ use crate::protobuf::MessageReader;
 use crate::Error;
 use crate::FieldDecode;
 use crate::MessageDecode;
+use alloc::slice;
+use alloc::vec;
 use core::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::slice;
+use core::mem::MaybeUninit;
 
 /// Calls `f` on `item`, splitting the pointer and initialized flag out.
 ///
@@ -247,7 +248,7 @@ unsafe fn read_fields_inline<R>(
             if *field_init {
                 // SAFETY: guaranteed by the caller.
                 unsafe {
-                    decoder.drop_struct(base.add(offset));
+                    decoder.drop_field(base.add(offset));
                 }
             }
         }
@@ -275,7 +276,7 @@ unsafe fn read_fields_inner<R>(
             let decoder = &decoders[index];
             // SAFETY: the decoder is valid according to the caller.
             unsafe {
-                decoder.read_struct(base.add(offsets[index]), &mut field_init[index], reader)?;
+                decoder.read_field(base.add(offsets[index]), &mut field_init[index], reader)?;
             }
         }
     }
@@ -283,7 +284,7 @@ unsafe fn read_fields_inner<R>(
         if !*field_init {
             // SAFETY: the decoder is valid according to the caller.
             unsafe {
-                decoder.default_struct(base.add(offset), field_init)?;
+                decoder.default_field(base.add(offset), field_init)?;
             }
             assert!(*field_init);
         }
@@ -345,7 +346,7 @@ unsafe fn default_fields_inline(
     for (i, (&offset, decoder)) in offsets.iter().zip(decoders).enumerate() {
         let mut field_initialized = *struct_initialized;
         // SAFETY: the decoder is valid according to the caller.
-        let r = unsafe { decoder.default_struct(base.add(offset), &mut field_initialized) };
+        let r = unsafe { decoder.default_field(base.add(offset), &mut field_initialized) };
         if let Err(err) = r {
             if !field_initialized || !*struct_initialized {
                 // Drop initialized fields.
@@ -357,7 +358,7 @@ unsafe fn default_fields_inline(
                     {
                         // SAFETY: the decoder is valid according to the caller, and the field is initialized.
                         unsafe {
-                            decoder.drop_struct(base.add(offset));
+                            decoder.drop_field(base.add(offset));
                         }
                     }
                 }
@@ -404,12 +405,12 @@ impl<'a, T, R> DecoderEntry<'a, T, R> {
     pub(crate) const fn custom<E: FieldDecode<'a, T, R>>() -> Self {
         Self(
             ErasedDecoderEntry(
-                std::ptr::from_ref(
+                core::ptr::from_ref(
                     const {
                         &StaticDecoderVtable {
                             read_fn: read_field_dyn::<T, R, E>,
                             default_fn: default_field_dyn::<T, R, E>,
-                            drop_fn: if std::mem::needs_drop::<T>() {
+                            drop_fn: if core::mem::needs_drop::<T>() {
                                 Some(drop_field_dyn::<T>)
                             } else {
                                 None
@@ -429,7 +430,7 @@ impl<'a, T, R> DecoderEntry<'a, T, R> {
     {
         Self(
             ErasedDecoderEntry(
-                std::ptr::from_ref(
+                core::ptr::from_ref(
                     const {
                         &DecoderTable {
                             count: T::NUMBERS.len(),
@@ -456,8 +457,15 @@ impl<'a, T, R> DecoderEntry<'a, T, R> {
 //
 // Internally, this is a pointer to either a vtable or a table.
 // The low bit is used to distinguish between the two.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct ErasedDecoderEntry(*const ());
+
+// SAFETY: the entry represents a set of integers and function pointers, which
+// have no cross-thread constraints.
+unsafe impl Send for ErasedDecoderEntry {}
+// SAFETY: the entry represents a set of integers and function pointers, which
+// have no cross-thread constraints.
+unsafe impl Sync for ErasedDecoderEntry {}
 
 const ENTRY_IS_TABLE: usize = 1;
 
@@ -483,12 +491,13 @@ impl ErasedDecoderEntry {
         }
     }
 
-    /// Reads a struct using the decoder metadata.
+    /// Reads a field using the decoder metadata.
     ///
     /// # Safety
     /// The caller must ensure that the decoder was for resource type `R` and
-    /// the object type matching what `ptr` is pointing to.
-    unsafe fn read_struct<R>(
+    /// the object type matches what `ptr` is pointing to. `*init` must be set
+    /// if and only if the field is initialized.
+    pub unsafe fn read_field<R>(
         &self,
         ptr: *mut u8,
         init: &mut bool,
@@ -511,12 +520,12 @@ impl ErasedDecoderEntry {
         }
     }
 
-    /// Initializes a struct to its default state using the decoder metadata.
+    /// Initializes a value to its default state using the decoder metadata.
     ///
     /// # Safety
     /// The caller must ensure that the decoder was for the object type matching
     /// what `ptr` is pointing to.
-    unsafe fn default_struct(&self, ptr: *mut u8, init: &mut bool) -> Result<(), Error> {
+    pub unsafe fn default_field(&self, ptr: *mut u8, init: &mut bool) -> Result<(), Error> {
         // SAFETY: guaranteed by caller.
         unsafe {
             match self.decode::<()>() {
@@ -528,12 +537,12 @@ impl ErasedDecoderEntry {
         }
     }
 
-    /// Drops a struct in place using the decoder metadata.
+    /// Drops a value in place using the decoder metadata.
     ///
     /// # Safety
     /// The caller must ensure that the decoder was for the object type matching
     /// what `ptr` is pointing to, and that `ptr` is ready to be dropped.
-    unsafe fn drop_struct(&self, ptr: *mut u8) {
+    pub unsafe fn drop_field(&self, ptr: *mut u8) {
         // SAFETY: guaranteed by caller.
         unsafe {
             match self.decode::<()>() {
@@ -546,7 +555,7 @@ impl ErasedDecoderEntry {
                     for i in 0..table.count {
                         let offset = *table.offsets.add(i);
                         let decoder = &*table.decoders.add(i);
-                        decoder.drop_struct(ptr.add(offset));
+                        decoder.drop_field(ptr.add(offset));
                     }
                 }
             }

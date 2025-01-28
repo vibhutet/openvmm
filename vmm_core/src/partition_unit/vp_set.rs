@@ -20,6 +20,7 @@ use guestmem::GuestMemory;
 use hvdef::Vtl;
 use inspect::Inspect;
 use mesh::rpc::Rpc;
+use mesh::rpc::RpcError;
 use mesh::rpc::RpcSend;
 use pal_async::local::block_with_io;
 use parking_lot::Mutex;
@@ -212,24 +213,37 @@ where
         state: &InitialRegs,
         to_set: RegistersToSet,
     ) -> Result<(), RegisterSetError> {
+        let InitialRegs {
+            registers,
+            #[cfg(guest_arch = "x86_64")]
+            mtrrs,
+            #[cfg(guest_arch = "x86_64")]
+            pat,
+            #[cfg(guest_arch = "aarch64")]
+            system_registers,
+        } = state;
         let mut access = self.vp.access_state(vtl);
         // Only set the registers on the BSP.
         if self.vp_index.is_bsp() && to_set == RegistersToSet::All {
             access
-                .set_registers(&state.registers)
+                .set_registers(registers)
                 .map_err(|err| RegisterSetError("registers", err.into()))?;
 
             #[cfg(guest_arch = "aarch64")]
             access
-                .set_system_registers(&state.system_registers)
+                .set_system_registers(system_registers)
                 .map_err(|err| RegisterSetError("system_registers", err.into()))?;
         }
 
-        // Set MTRRs on all VPs.
+        // Set MTRRs and PAT on all VPs.
         #[cfg(guest_arch = "x86_64")]
         access
-            .set_cache_control(&state.cc)
+            .set_mtrrs(mtrrs)
             .map_err(|err| RegisterSetError("mtrrs", err.into()))?;
+        #[cfg(guest_arch = "x86_64")]
+        access
+            .set_pat(pat)
+            .map_err(|err| RegisterSetError("pat", err.into()))?;
 
         Ok(())
     }
@@ -877,7 +891,7 @@ pub struct RegisterSetError(&'static str, #[source] anyhow::Error);
 
 #[derive(Debug, Error)]
 #[error("the vp runner was dropped")]
-struct RunnerGoneError(#[source] mesh::RecvError);
+struct RunnerGoneError(#[source] RpcError);
 
 #[cfg(feature = "gdb")]
 impl VpSet {
@@ -1271,6 +1285,7 @@ mod vp_state {
         gva: u64,
     ) -> anyhow::Result<u64> {
         let state = debug.get_vp_state(vtl).context("failed to get vp state")?;
+
         match &*state {
             DebuggerVpState::X86_64(state) => {
                 let registers = virt_support_x86emu::translate::TranslationRegisters {
@@ -1298,7 +1313,8 @@ mod vp_state {
                     gva,
                     &registers,
                     flags,
-                )?)
+                )?
+                .gpa)
             }
             DebuggerVpState::Aarch64(state) => {
                 let registers = virt_support_aarch64emu::translate::TranslationRegisters {

@@ -14,7 +14,7 @@ use flowey::node::prelude::*;
 //
 // This would require nodes that currently accept a `Version(String)` to accept
 // a `Version(ReadVar<String>)`, but that shouldn't be a serious blocker.
-pub const AZCOPY: &str = "10.27.0-20241030";
+pub const AZCOPY: &str = "10.27.1-20241113";
 pub const AZURE_CLI: &str = "2.56.0";
 pub const FUZZ: &str = "0.12.0";
 pub const GH_CLI: &str = "2.52.0";
@@ -22,12 +22,12 @@ pub const LXUTIL: &str = "10.0.26100.1-240331-1435.ge-release";
 pub const MDBOOK: &str = "0.4.40";
 pub const MDBOOK_ADMONISH: &str = "1.18.0";
 pub const MDBOOK_MERMAID: &str = "0.14.0";
-pub const RUSTUP_TOOLCHAIN: &str = "1.82.0";
+pub const RUSTUP_TOOLCHAIN: &str = "1.84.0";
 pub const MU_MSVM: &str = "24.0.4";
 pub const NEXTEST: &str = "0.9.74";
 pub const NODEJS: &str = "18.x";
-pub const OPENHCL_KERNEL_DEV_VERSION: &str = "6.6.51.9";
-pub const OPENHCL_KERNEL_STABLE_VERSION: &str = "6.6.51.7";
+pub const OPENHCL_KERNEL_DEV_VERSION: &str = "6.6.63.1";
+pub const OPENHCL_KERNEL_STABLE_VERSION: &str = "6.6.63.1";
 pub const OPENVMM_DEPS: &str = "0.1.0-20241014.2";
 pub const PROTOC: &str = "27.1";
 

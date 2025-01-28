@@ -60,6 +60,7 @@ pub fn ado_yaml(
         ado_resources_repository,
         ado_post_process_yaml_cb,
         ado_variables,
+        ref ado_job_id_overrides,
         gh_name: _,
         gh_schedule_triggers: _,
         gh_ci_triggers: _,
@@ -283,6 +284,8 @@ echo "$(FLOWEY_TEMP_DIR)/work" | {var_db_insert_working_dir}
                 flowey_core::pipeline::internal::Parameter::Bool { .. }
             );
 
+            let name = parameters[*pipeline_param_idx].name();
+
             // ADO resolves bools as `True` and `False`, _sigh_
             let with_lowercase = if is_bool {
                 r#" | tr '[:upper:]' '[:lower:]'"#
@@ -295,7 +298,7 @@ echo "$(FLOWEY_TEMP_DIR)/work" | {var_db_insert_working_dir}
             let cmd = format!(
                 r#"
 cat <<'EOF'{with_lowercase} | {var_db_inject_cmd}
-${{{{ parameters.param{pipeline_param_idx} }}}}
+${{{{ parameters.{name} }}}}
 EOF
 "#
             )
@@ -510,8 +513,14 @@ EOF
             )
         };
 
+        let get_job_id = |id: usize| {
+            ado_job_id_overrides
+                .get(&id)
+                .cloned()
+                .unwrap_or_else(|| format!("job{}", id.clone()))
+        };
         ado_jobs.push(schema_ado_yaml::Job {
-            job: format!("job{}", job_idx.index()),
+            job: get_job_id(job_idx.index()),
             display_name: label.clone(),
             pool,
             depends_on: {
@@ -519,24 +528,30 @@ EOF
                     .edges_directed(job_idx, petgraph::Direction::Incoming)
                     .map(|e| {
                         use petgraph::prelude::*;
-                        format!("job{}", e.source().index())
+                        get_job_id(e.source().index())
                     })
                     .collect()
             },
-            variables:  {
-                let mut ado_variables: Vec<schema_ado_yaml::Variable> = ado_variables.clone().into_iter()
-                        .map(|(name, value)| schema_ado_yaml::Variable { name, value })
-                        .collect();
+            variables: {
+                let mut ado_variables: Vec<schema_ado_yaml::Variable> = ado_variables
+                    .clone()
+                    .into_iter()
+                    .map(|(name, value)| schema_ado_yaml::Variable { name, value })
+                    .collect();
 
-                ado_variables.push(schema_ado_yaml::Variable {name: "FLOWEY_TEMP_DIR".into(), value: FLOWEY_TEMP_DIR.into()});
+                ado_variables.push(schema_ado_yaml::Variable {
+                    name: "FLOWEY_TEMP_DIR".into(),
+                    value: FLOWEY_TEMP_DIR.into(),
+                });
 
-                Some(
-                    ado_variables
-                )
+                Some(ado_variables)
             },
             steps: ado_steps,
             condition: Some(if let Some(cond_param_idx) = cond_param_idx {
-                format!("and(eq('${{{{ parameters.param{cond_param_idx} }}}}', 'true'), succeeded(), not(canceled()))")
+                format!(
+                    "and(eq('${{{{ parameters.{} }}}}', 'true'), succeeded(), not(canceled()))",
+                    parameters[cond_param_idx].name()
+                )
             } else {
                 "and(succeeded(), not(canceled()))".into()
             }),
@@ -637,23 +652,27 @@ EOF
         parameters: if !parameters.is_empty() {
             Some(
                 parameters
+                    .clone()
                     .into_iter()
-                    .enumerate()
-                    .map(|(idx, param)| match param {
+                    .map(|param| match param {
                         flowey_core::pipeline::internal::Parameter::Bool {
+                            name,
                             description,
+                            kind: _,
                             default,
                         } => schema_ado_yaml::Parameter {
-                            name: format!("param{idx}"),
+                            name,
                             display_name: description,
                             ty: schema_ado_yaml::ParameterType::Boolean { default },
                         },
                         flowey_core::pipeline::internal::Parameter::String {
+                            name,
                             description,
+                            kind: _,
                             default,
                             possible_values,
                         } => schema_ado_yaml::Parameter {
-                            name: format!("param{idx}"),
+                            name,
                             display_name: description,
                             ty: schema_ado_yaml::ParameterType::String {
                                 default,
@@ -661,11 +680,13 @@ EOF
                             },
                         },
                         flowey_core::pipeline::internal::Parameter::Num {
+                            name,
                             description,
+                            kind: _,
                             default,
                             possible_values,
                         } => schema_ado_yaml::Parameter {
-                            name: format!("param{idx}"),
+                            name,
                             display_name: description,
                             ty: schema_ado_yaml::ParameterType::Number {
                                 default,
@@ -703,7 +724,8 @@ EOF
                                     r#ref: match git_ref {
                                         AdoResourcesRepositoryRef::Fixed(s) => s,
                                         AdoResourcesRepositoryRef::Parameter(idx) => {
-                                            format!("${{{{ parameters.param{idx} }}}}")
+                                            let name = parameters[idx].name();
+                                            format!("${{{{ parameters.{name} }}}}")
                                         }
                                     },
                                     r#type: match repo_type {

@@ -38,6 +38,7 @@ pub struct ResolvedPipeline {
     pub ado_resources_repository: Vec<InternalAdoResourcesRepository>,
     pub ado_post_process_yaml_cb: Option<Box<dyn FnOnce(serde_yaml::Value) -> serde_yaml::Value>>,
     pub ado_variables: BTreeMap<String, String>,
+    pub ado_job_id_overrides: BTreeMap<usize, String>,
     pub gh_name: Option<String>,
     pub gh_schedule_triggers: Vec<GhScheduleTriggers>,
     pub gh_ci_triggers: Option<GhCiTriggers>,
@@ -94,6 +95,7 @@ pub fn resolve_pipeline(pipeline: Pipeline) -> anyhow::Result<ResolvedPipeline> 
         ado_resources_repository,
         ado_post_process_yaml_cb,
         ado_variables,
+        ado_job_id_overrides,
         gh_name,
         gh_schedule_triggers,
         gh_ci_triggers,
@@ -200,9 +202,7 @@ pub fn resolve_pipeline(pipeline: Pipeline) -> anyhow::Result<ResolvedPipeline> 
         let parameters_used: Vec<_> = parameters_used
             .into_iter()
             .map(|param_idx| ResolvedJobUseParameter {
-                flowey_var: flowey_core::pipeline::internal::consistent_param_runtime_var_name(
-                    param_idx,
-                ),
+                flowey_var: parameters[param_idx].name().to_string(),
                 pipeline_param_idx: param_idx,
             })
             .collect();
@@ -275,6 +275,7 @@ pub fn resolve_pipeline(pipeline: Pipeline) -> anyhow::Result<ResolvedPipeline> 
         ado_bootstrap_template,
         ado_resources_repository,
         ado_post_process_yaml_cb,
+        ado_job_id_overrides,
         gh_name,
         gh_schedule_triggers,
         gh_ci_triggers,

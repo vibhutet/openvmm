@@ -162,7 +162,7 @@ open_enum! {
 
 pub use header::*;
 // UNSAFETY: The unsafe manual impl of AsBytes for HeaderGeneric
-#[allow(unsafe_code)]
+#[expect(unsafe_code)]
 pub mod header {
     use super::MessageTypes;
     use super::MessageVersions;
@@ -581,8 +581,6 @@ pub const IGVM_ATTEST_MSG_REQ_REPORT_MAX_SIZE: usize = 4096;
 
 /// Maximum return pages
 pub const IGVM_ATTEST_MSG_MAX_SHARED_GPA: usize = 16;
-/// Current return pages
-pub const IGVM_ATTEST_MSG_SHARED_GPA: usize = IGVM_ATTEST_MSG_MAX_SHARED_GPA;
 
 // Error from the VM worker process in the host when sending an
 // attestation request.
@@ -1179,12 +1177,12 @@ impl UpdateGenerationId {
 
 /// Bitfield describing SaveGuestVtl2StateNotification::capabilities_flags
 #[bitfield(u64)]
+#[derive(AsBytes, FromBytes, FromZeroes)]
 pub struct SaveGuestVtl2StateFlags {
-    /// Disable nvme_keepalive feature when servicing.
+    /// Explicitly allow nvme_keepalive feature when servicing.
     #[bits(1)]
-    pub disable_nvme_keepalive: bool,
-
-    /// Reserved
+    pub enable_nvme_keepalive: bool,
+    /// Reserved, must be zero.
     #[bits(63)]
     _rsvd1: u64,
 }
@@ -1194,7 +1192,7 @@ pub struct SaveGuestVtl2StateFlags {
 pub struct SaveGuestVtl2StateNotification {
     pub message_header: HeaderGuestNotification,
     pub correlation_id: Guid,
-    pub capabilities_flags: u64,
+    pub capabilities_flags: SaveGuestVtl2StateFlags,
     pub timeout_hint_secs: u16,
 }
 

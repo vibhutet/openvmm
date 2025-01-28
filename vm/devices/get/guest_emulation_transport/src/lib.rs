@@ -1,13 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+#![cfg(target_os = "linux")]
+
 //! Guest Emulation Transport - GET
 //!
 //! The GET is the guest side of a communication channel that uses VMBUS to communicate between Guest and Host.
 //! The Guest sends messages through the GET to get information on the time, VMGS file, attestation,
 //! platform settings, bios boot settings, and guest state protection.
 
-#![cfg(unix)]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -51,7 +52,7 @@ pub async fn spawn_get_worker(
 }
 
 #[cfg(any(feature = "test_utilities", test))]
-#[allow(missing_docs)]
+#[expect(missing_docs)]
 pub mod test_utilities {
     use super::*;
     use crate::worker::GuestEmulationTransportWorker;

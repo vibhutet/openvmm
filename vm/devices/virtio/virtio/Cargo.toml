@@ -3,12 +3,14 @@
 
 [package]
 name = "virtio"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 device_emulators.workspace = true
 pci_core.workspace = true
+pci_resources.workspace = true
+virtio_resources.workspace = true
 
 chipset_device.workspace = true
 guestmem.workspace = true

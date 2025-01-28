@@ -3,13 +3,14 @@
 
 [package]
 name = "vmbfs"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 vmbfs_resources.workspace = true
 vm_resource.workspace = true
 
+guestmem.workspace = true
 vmbus_async.workspace = true
 vmbus_channel.workspace = true
 vmcore.workspace = true

@@ -3,7 +3,7 @@
 
 [package]
 name = "ide"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -26,7 +26,6 @@ guestmem.workspace = true
 vmcore.workspace = true
 
 bitfield-struct.workspace = true
-bitflags.workspace = true
 static_assertions.workspace = true
 thiserror.workspace = true
 tracelimit.workspace = true

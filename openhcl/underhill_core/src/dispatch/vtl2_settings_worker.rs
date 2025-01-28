@@ -8,7 +8,7 @@ use crate::nvme_manager::NvmeDiskConfig;
 use crate::worker::NicConfig;
 use anyhow::Context;
 use disk_backend::resolve::ResolveDiskParameters;
-use disk_backend::SimpleDisk;
+use disk_backend::Disk;
 use disk_backend_resources::AutoFormattedDiskHandle;
 use disk_blockdevice::OpenBlockDeviceConfig;
 use futures::StreamExt;
@@ -19,6 +19,7 @@ use ide_resources::IdeControllerConfig;
 use ide_resources::IdeDeviceConfig;
 use ide_resources::IdePath;
 use mesh::rpc::Rpc;
+use mesh::rpc::RpcError;
 use mesh::rpc::RpcSend;
 use mesh::CancelContext;
 use nvme_resources::NamespaceDefinition;
@@ -31,7 +32,6 @@ use std::error::Error as _;
 use std::fmt::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 use storage_string::InvalidAsciiString;
 use storvsp_resources::ScsiControllerHandle;
@@ -62,7 +62,7 @@ use vm_resource::ResourceResolver;
 #[derive(Error, Debug)]
 enum Error<'a> {
     #[error("RPC error")]
-    Rpc(#[source] mesh::RecvError),
+    Rpc(#[source] RpcError),
     #[error("cannot add/remove storage controllers at runtime")]
     StorageCannotAddRemoveControllerAtRuntime,
     #[error("Striping devices don't support runtime change")]
@@ -541,11 +541,11 @@ pub(crate) async fn handle_vtl2_config_rpc(
     }
 }
 
-pub async fn disk_from_disk_type<'a>(
+pub async fn disk_from_disk_type(
     disk_type: Resource<DiskHandleKind>,
     read_only: bool,
     resolver: &ResourceResolver,
-) -> Result<Arc<dyn SimpleDisk>, Vtl2SettingsErrorInfo> {
+) -> Result<Disk, Vtl2SettingsErrorInfo> {
     let disk = resolver
         .resolve(
             disk_type,
@@ -1146,6 +1146,7 @@ fn make_disk_config_inner(
         scsi_disk_size_in_bytes: disk_params.scsi_disk_size_in_bytes,
         odx: disk_params.odx,
         unmap: disk_params.unmap,
+        get_lba_status: true,
         max_transfer_length: disk_params.max_transfer_length,
         optimal_unmap_sectors: None, // TODO
     })

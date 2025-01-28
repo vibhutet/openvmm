@@ -101,6 +101,23 @@ pub enum TryWriteError {
     Queue(#[source] Error),
 }
 
+/// An error returned by `read_external_ranges`
+#[derive(Debug, Error)]
+pub enum ExternalDataError {
+    /// The packet is corrupted in some way (e.g. it does not specify a reasonable set of GPA ranges).
+    #[error("invalid gpa ranges")]
+    GpaRange(#[source] vmbus_ring::gparange::Error),
+
+    /// The packet specifies memory that this vmbus cannot read, for some reason.
+    #[error("access error")]
+    Access(#[source] AccessError),
+
+    /// Caller used `read_external_ranges` when the packet contains a buffer id,
+    /// and the caller should have called `read_transfer_ranges`
+    #[error("external data should have been read by calling read_transfer_ranges")]
+    WrongExternalDataType,
+}
+
 /// An incoming packet batch reader.
 pub struct ReadBatch<'a, M: RingMem> {
     core: &'a Core<M>,
@@ -141,7 +158,7 @@ impl<'a, M: RingMem> ReadBatch<'a, M> {
     }
 }
 
-impl<'a, 'b, M: RingMem> Iterator for ReadBatchIter<'a, 'b, M> {
+impl<'a, M: RingMem> Iterator for ReadBatchIter<'a, '_, M> {
     type Item = Result<IncomingPacket<'a, M>, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -149,7 +166,7 @@ impl<'a, 'b, M: RingMem> Iterator for ReadBatchIter<'a, 'b, M> {
     }
 }
 
-impl<'a, M: RingMem> Drop for ReadBatch<'a, M> {
+impl<M: RingMem> Drop for ReadBatch<'_, M> {
     fn drop(&mut self) {
         self.read.clear_poll(self.core);
         if self.core.in_ring().commit_read(&mut self.read.ptrs) {
@@ -179,7 +196,7 @@ impl<'a, M: RingMem> AsRef<IncomingPacket<'a, M>> for PacketRef<'a, M> {
     }
 }
 
-impl<'a, M: RingMem> PacketRef<'a, M> {
+impl<M: RingMem> PacketRef<'_, M> {
     /// Revert the read pointers, allowing a peek at the next packet.
     ///
     /// Use this with care: a malicious guest could change the packet's
@@ -269,18 +286,21 @@ impl<T: RingMem> DataPacket<'_, T> {
     }
 
     /// Reads the GPA direct range descriptors from the packet.
-    pub fn read_external_ranges(&self) -> Result<MultiPagedRangeBuf<GpnList>, AccessError> {
+    pub fn read_external_ranges(&self) -> Result<MultiPagedRangeBuf<GpnList>, ExternalDataError> {
         if self.buffer_id.is_some() {
-            return Err(AccessError::OutOfRange(0, 0));
+            return Err(ExternalDataError::WrongExternalDataType);
         } else if self.external_data.0 == 0 {
-            return Ok(MultiPagedRangeBuf::new(0, GpnList::new()).unwrap());
+            return Ok(MultiPagedRangeBuf::empty());
         }
 
         let mut reader = self.external_data.1.reader(self.ring);
         let len = reader.len() / 8;
         let mut buf = zeroed_gpn_list(len);
-        reader.read(buf.as_bytes_mut())?;
-        Ok(MultiPagedRangeBuf::new(self.external_data.0 as usize, buf).unwrap())
+        reader
+            .read(buf.as_bytes_mut())
+            .map_err(ExternalDataError::Access)?;
+        MultiPagedRangeBuf::new(self.external_data.0 as usize, buf)
+            .map_err(ExternalDataError::GpaRange)
     }
 
     /// Reads the transfer buffer ID from the packet, or None if this is not a transfer packet.
@@ -298,7 +318,7 @@ impl<T: RingMem> DataPacket<'_, T> {
         I: Iterator<Item = PagedRange<'a>>,
     {
         if self.external_data.0 == 0 {
-            return Ok(MultiPagedRangeBuf::new(0, GpnList::new()).unwrap());
+            return Ok(MultiPagedRangeBuf::empty());
         }
 
         let buf: MultiPagedRangeBuf<GpnList> = transfer_buf.collect();
@@ -457,7 +477,7 @@ impl<'a, M: RingMem> ReadHalf<'a, M> {
 /// An asynchronous batch read operation.
 pub struct BatchRead<'a, 'b, M: RingMem>(Option<&'a mut ReadHalf<'b, M>>);
 
-impl<'a, 'b, M: RingMem> Future for BatchRead<'a, 'b, M> {
+impl<'a, M: RingMem> Future for BatchRead<'a, '_, M> {
     type Output = Result<ReadBatch<'a, M>, Error>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -475,7 +495,7 @@ impl<'a, 'b, M: RingMem> Future for BatchRead<'a, 'b, M> {
 /// An asynchronous read operation.
 pub struct Read<'a, 'b, M: RingMem>(BatchRead<'a, 'b, M>);
 
-impl<'a, 'b, M: RingMem> Future for Read<'a, 'b, M> {
+impl<'a, M: RingMem> Future for Read<'a, '_, M> {
     type Output = Result<PacketRef<'a, M>, Error>;
 
     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -667,7 +687,7 @@ pub struct Write<'a, 'b, 'c, M: RingMem> {
     packet: OutgoingPacket<'c, 'b>,
 }
 
-impl<'a, 'b, 'c, M: RingMem> Future for Write<'a, 'b, 'c, M> {
+impl<M: RingMem> Future for Write<'_, '_, '_, M> {
     type Output = Result<(), Error>;
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -732,7 +752,7 @@ pub fn connected_queues(ring_size: usize) -> (Queue<FlatRingMem>, Queue<FlatRing
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
     use super::*;
     use pal_async::async_test;
     use pal_async::task::Spawn;
@@ -796,6 +816,57 @@ pub mod tests {
                         assert_eq!(p.gpns(), q.gpns());
                     }
                     Ok(())
+                }
+                _ => Err("should be data"),
+            })
+            .unwrap()
+            .unwrap();
+    }
+
+    #[async_test]
+    async fn test_gpa_direct_empty_external_data() {
+        use guestmem::ranges::PagedRange;
+
+        let (mut host_queue, mut guest_queue) = connected_queues(16384);
+
+        let gpa1: Vec<u64> = vec![];
+        let gpas = vec![PagedRange::new(0, 0, &gpa1).unwrap()];
+
+        let payload: &[u8] = &[0xf; 24];
+        guest_queue
+            .split()
+            .1
+            .write(OutgoingPacket {
+                transaction_id: 0,
+                packet_type: OutgoingPacketType::GpaDirect(&gpas),
+                payload: &[payload],
+            })
+            .await
+            .unwrap();
+        host_queue
+            .split()
+            .0
+            .read_batch()
+            .await
+            .unwrap()
+            .packets()
+            .next()
+            .map(|p| match p.unwrap() {
+                IncomingPacket::Data(data) => {
+                    // Check the payload
+                    let mut in_payload = [0_u8; 24];
+                    assert_eq!(payload.len(), data.reader().len());
+                    data.reader().read(&mut in_payload).unwrap();
+                    assert_eq!(in_payload, payload);
+
+                    // Check the external ranges
+                    assert_eq!(data.external_range_count(), 1);
+                    let external_data_result = data.read_external_ranges();
+                    assert_eq!(data.read_external_ranges().is_err(), true);
+                    match external_data_result {
+                        Err(ExternalDataError::GpaRange(_)) => Ok(()),
+                        _ => Err("should be out of range"),
+                    }
                 }
                 _ => Err("should be data"),
             })

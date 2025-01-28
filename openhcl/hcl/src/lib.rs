@@ -7,7 +7,7 @@
 #![cfg(target_os = "linux")]
 #![warn(missing_docs)]
 // UNSAFETY: Calling ioctls.
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 
 use hvdef::hypercall::HvInputVtl;
 use hvdef::Vtl;
@@ -27,9 +27,9 @@ pub mod vmsa;
 #[derive(Copy, Clone, Debug, Inspect, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GuestVtl {
     /// VTL0
-    Vtl0,
+    Vtl0 = 0,
     /// VTL1
-    Vtl1,
+    Vtl1 = 1,
 }
 
 impl From<GuestVtl> for HvInputVtl {

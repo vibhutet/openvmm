@@ -3,7 +3,7 @@
 
 [package]
 name = "disk_get_vmgs"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -15,7 +15,6 @@ scsi_buffers.workspace = true
 inspect.workspace = true
 mesh.workspace = true
 
-stackfuture.workspace = true
 thiserror.workspace = true
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]

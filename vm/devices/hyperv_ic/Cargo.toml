@@ -3,10 +3,11 @@
 
 [package]
 name = "hyperv_ic"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+guestmem.workspace = true
 hyperv_ic_protocol.workspace = true
 hyperv_ic_resources.workspace = true
 vmbus_async.workspace = true

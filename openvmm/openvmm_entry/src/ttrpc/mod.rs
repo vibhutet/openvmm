@@ -21,6 +21,7 @@ use hvlite_defs::config::MemoryConfig;
 use hvlite_defs::config::ProcessorTopologyConfig;
 use hvlite_defs::config::VirtioBus;
 use hvlite_defs::config::VmbusConfig;
+use hvlite_defs::config::VpciDeviceConfig;
 use hvlite_defs::rpc::VmRpc;
 use hvlite_defs::worker::VmWorkerParameters;
 use hvlite_defs::worker::VM_WORKER;
@@ -32,7 +33,6 @@ use inspect_proto::InspectResponse2;
 use inspect_proto::InspectService;
 use inspect_proto::UpdateResponse2;
 use mesh::error::RemoteError;
-use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use mesh::CancelReason;
 use mesh::MeshPayload;
@@ -56,6 +56,7 @@ use storvsp_resources::ScsiControllerHandle;
 use storvsp_resources::ScsiControllerRequest;
 use storvsp_resources::ScsiDeviceAndPath;
 use unix_socket::UnixListener;
+use virtio_resources::VirtioPciDeviceHandle;
 use vm_manifest_builder::VmManifestBuilder;
 use vm_resource::kind::VmbusDeviceHandleKind;
 use vm_resource::IntoResource;
@@ -143,10 +144,8 @@ impl VmService {
         mut recv: mesh::Receiver<WorkerRpc<()>>,
     ) -> anyhow::Result<()> {
         let mut server = mesh_rpc::Server::new();
-        let (vm_service_send, mut vm_service_recv) = mesh::channel();
-        let (inspect_service_send, mut inspect_service_recv) = mesh::channel();
-        server.add_service::<vmservice::Vm>(vm_service_send);
-        server.add_service::<InspectService>(inspect_service_send);
+        let mut vm_service_recv = server.add_service::<vmservice::Vm>();
+        let mut inspect_service_recv = server.add_service::<InspectService>();
 
         let transport = self.transport;
         let (cancel_send, cancel_recv) = mesh::oneshot();
@@ -197,7 +196,7 @@ impl VmService {
                 },
                 request = recv.recv().fuse() => {
                     match request {
-                        Ok(WorkerRpc::Restart(response)) => response.send(Err(RemoteError::new(anyhow::anyhow!("not supported")))),
+                        Ok(WorkerRpc::Restart(rpc)) => rpc.complete(Err(RemoteError::new(anyhow::anyhow!("not supported")))),
                         Ok(WorkerRpc::Inspect(_)) => (),
                         Ok(WorkerRpc::Stop) => {
                             tracing::info!("ttrpc worker stopping");
@@ -240,7 +239,7 @@ impl VmService {
         r: anyhow::Result<F>,
     ) where
         F: 'static + Future<Output = anyhow::Result<R>> + Send,
-        R: MeshPayload,
+        R: 'static + MeshPayload + Send,
     {
         match r {
             Ok(fut) => {
@@ -353,15 +352,9 @@ impl VmService {
     async fn handle_inspect(&mut self, ctx: mesh::CancelContext, request: InspectService) {
         match request {
             InspectService::Inspect(request, response) => {
-                // Use a locally-defined type for the response in order to avoid
-                // reshuffling inspection results to protobuf types.
-                let response = response.upcast::<Result<InspectResponse2, Status>>();
                 self.start_rpc(response, Ok(self.inspect(ctx, request)))
             }
             InspectService::Update(request, response) => {
-                // Use a locally-defined type for the response in order to avoid
-                // reshuffling inspection results to protobuf types.
-                let response = response.upcast::<Result<UpdateResponse2, Status>>();
                 self.start_rpc(response, Ok(self.update(ctx, request)))
             }
         }
@@ -371,7 +364,7 @@ impl VmService {
         &self,
         ctx: mesh::CancelContext,
         request: inspect_proto::InspectRequest,
-    ) -> impl Future<Output = anyhow::Result<InspectResponse2>> {
+    ) -> impl Future<Output = anyhow::Result<InspectResponse2>> + use<> {
         let mut inspection = InspectionBuilder::new(&request.path)
             .depth(Some(request.depth as usize))
             .inspect(inspect::adhoc(|req| {
@@ -394,7 +387,7 @@ impl VmService {
         &self,
         ctx: mesh::CancelContext,
         request: inspect_proto::UpdateRequest,
-    ) -> impl Future<Output = anyhow::Result<UpdateResponse2>> {
+    ) -> impl Future<Output = anyhow::Result<UpdateResponse2>> + use<> {
         let update = inspect::update(
             &request.path,
             &request.value,
@@ -542,16 +535,25 @@ impl VmService {
             }
 
             for virtiofs in devices_config.virtiofs_config {
-                config.virtio_devices.push((
-                    VirtioBus::Auto,
-                    virtio_resources::fs::VirtioFsHandle {
-                        tag: virtiofs.tag,
-                        fs: virtio_resources::fs::VirtioFsBackend::HostFs {
-                            root_path: virtiofs.root_path,
-                        },
-                    }
-                    .into_resource(),
-                ));
+                let resource = virtio_resources::fs::VirtioFsHandle {
+                    tag: virtiofs.tag,
+                    fs: virtio_resources::fs::VirtioFsBackend::HostFs {
+                        root_path: virtiofs.root_path,
+                        mount_options: String::new(),
+                    },
+                }
+                .into_resource();
+                // Use VPCI when possible (currently only on Windows and macOS due
+                // to KVM backend limitations).
+                if cfg!(windows) || cfg!(target_os = "macos") {
+                    config.vpci_devices.push(VpciDeviceConfig {
+                        vtl: DeviceVtl::Vtl0,
+                        instance_id: Guid::new_random(),
+                        resource: VirtioPciDeviceHandle(resource).into_resource(),
+                    });
+                } else {
+                    config.virtio_devices.push((VirtioBus::Pci, resource));
+                }
             }
         }
 
@@ -601,15 +603,13 @@ impl VmService {
         Ok(())
     }
 
-    fn pause_vm(&mut self, vm: &Vm) -> impl Future<Output = anyhow::Result<()>> {
-        let (send, recv) = mesh::oneshot();
-        vm.worker_rpc.send(VmRpc::Pause(Rpc((), send)));
+    fn pause_vm(&mut self, vm: &Vm) -> impl Future<Output = anyhow::Result<()>> + use<> {
+        let recv = vm.worker_rpc.call(VmRpc::Pause, ());
         async move { recv.await.map(drop).context("pause failed") }
     }
 
-    fn resume_vm(&mut self, vm: &Vm) -> impl Future<Output = anyhow::Result<()>> {
-        let (send, recv) = mesh::oneshot();
-        vm.worker_rpc.send(VmRpc::Resume(Rpc((), send)));
+    fn resume_vm(&mut self, vm: &Vm) -> impl Future<Output = anyhow::Result<()>> + use<> {
+        let recv = vm.worker_rpc.call(VmRpc::Resume, ());
         async move { recv.await.map(drop).context("resume failed") }
     }
 
@@ -617,7 +617,7 @@ impl VmService {
         &mut self,
         mut ctx: mesh::CancelContext,
         vm: Arc<Vm>,
-    ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>>> {
+    ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>> + use<>> {
         let mut notify_recv = vm
             .notify_recv
             .lock()
@@ -642,7 +642,7 @@ impl VmService {
         &mut self,
         vm: &Vm,
         request: vmservice::ModifyResourceRequest,
-    ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>>> {
+    ) -> anyhow::Result<impl Future<Output = anyhow::Result<()>> + use<>> {
         use vmservice::modify_resource_request::Resource;
         match request.resource.context("missing resource")? {
             Resource::ScsiDisk(disk) => {

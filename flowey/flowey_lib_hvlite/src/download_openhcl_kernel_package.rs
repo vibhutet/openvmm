@@ -99,10 +99,8 @@ impl FlowNode for Node {
                 },
                 version,
                 match kind {
-                    OpenhclKernelPackageKind::Main => "-main",
-                    OpenhclKernelPackageKind::Cvm => "-main-cvm",
-                    OpenhclKernelPackageKind::Dev => "",
-                    OpenhclKernelPackageKind::CvmDev => "-cvm",
+                    OpenhclKernelPackageKind::Main | OpenhclKernelPackageKind::Dev => "",
+                    OpenhclKernelPackageKind::Cvm | OpenhclKernelPackageKind::CvmDev => "-cvm",
                 },
                 match arch {
                     OpenhclKernelPackageArch::X86_64 => "x64",
@@ -120,7 +118,7 @@ impl FlowNode for Node {
                     path: v,
                 });
 
-            ctx.emit_rust_step(format!("unpack {file_name}"), |ctx| {
+            ctx.emit_rust_step("unpack kernel package", |ctx| {
                 let extract_zip_deps = extract_zip_deps.clone().claim(ctx);
                 let out_vars = out_vars.claim(ctx);
                 let kernel_package_tar_gz = kernel_package_tar_gz.claim(ctx);

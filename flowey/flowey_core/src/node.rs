@@ -838,7 +838,7 @@ pub struct NodeCtx<'a> {
     backend: Rc<RefCell<&'a mut dyn NodeCtxBackend>>,
 }
 
-impl<'backend> NodeCtx<'backend> {
+impl NodeCtx<'_> {
     /// Emit a Rust-based step.
     ///
     /// As a convenience feature, this function returns a special _optional_
@@ -2275,7 +2275,7 @@ pub mod private {
     pub static FLOW_NODES: [FlowNodeMeta] = [..];
 
     // UNSAFETY: linkme uses manual link sections, which are unsafe.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code)]
     #[linkme::distributed_slice(FLOW_NODES)]
     static DUMMY_FLOW_NODE: FlowNodeMeta = FlowNodeMeta {
         module_path: "<dummy>::_only_one_call_to_flowey_node_per_module",

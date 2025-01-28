@@ -3,13 +3,14 @@
 
 [package]
 name = "vmgs_lib"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
+disk_backend.workspace = true
 disk_vhd1.workspace = true
 futures.workspace = true
 vmgs_format.workspace = true

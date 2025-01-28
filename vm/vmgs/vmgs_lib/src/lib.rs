@@ -5,9 +5,10 @@
 
 // UNSAFETY: Exporting no_mangle extern C functions and dealing with the raw
 // pointers necessary to do so.
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 
 use core::slice;
+use disk_backend::Disk;
 use disk_vhd1::Vhd1Disk;
 use futures::executor::block_on;
 use std::ffi::c_char;
@@ -16,7 +17,6 @@ use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use vmgs::EncryptionAlgorithm;
 use vmgs::Vmgs;
 use vmgs_format::FileId;
@@ -48,6 +48,7 @@ pub enum VmgsError {
 ///
 /// `file_path` must point to a valid null-terminated utf-8 string.
 /// `in_len` must be the size of `in_buf` in bytes and match the value returned from query_size_vmgs
+// SAFETY: In this library this function name is unique.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn read_vmgs(
     file_path: *const c_char,
@@ -104,7 +105,7 @@ pub unsafe extern "C" fn read_vmgs(
     VmgsError::Ok
 }
 
-fn open_disk(file_path: &str, read_only: bool) -> Result<Arc<Vhd1Disk>, VmgsError> {
+fn open_disk(file_path: &str, read_only: bool) -> Result<Disk, VmgsError> {
     let file = File::options()
         .read(true)
         .write(!read_only)
@@ -112,7 +113,7 @@ fn open_disk(file_path: &str, read_only: bool) -> Result<Arc<Vhd1Disk>, VmgsErro
         .map_err(|_| VmgsError::FileDisk)?;
 
     let disk = Vhd1Disk::open_fixed(file, read_only).map_err(|_| VmgsError::FileDisk)?;
-    Ok(Arc::new(disk))
+    Disk::new(disk).map_err(|_| VmgsError::FileDisk)
 }
 
 async fn do_read(
@@ -152,6 +153,7 @@ async fn do_read(
 ///
 /// `file_path` and `data_path` must point to valid null-terminated utf-8 strings.
 /// `encryption_key` must be null-terminated and nonnull if using encryption
+// SAFETY: In this library this function name is unique.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn write_vmgs(
     file_path: *const c_char,
@@ -239,6 +241,7 @@ async fn do_write(
 /// # Safety
 ///
 /// `path` must point to a valid null-terminated utf-8 string.
+// SAFETY: In this library this function name is unique.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn create_vmgs(
     path: *const c_char,
@@ -317,7 +320,7 @@ async fn do_create(
 
     let disk = Vhd1Disk::open_fixed(file, false).map_err(|_| VmgsError::FileDisk)?;
 
-    let mut vmgs = Vmgs::format_new(Arc::new(disk))
+    let mut vmgs = Vmgs::format_new(Disk::new(disk).map_err(|_| VmgsError::FileDisk)?)
         .await
         .map_err(|_| VmgsError::InvalidVmgs)?;
 
@@ -335,6 +338,7 @@ async fn do_create(
 ///
 /// `path` pointer must point to a valid, null-terminated utf-8 string.
 /// `out_size` pointer must be nonnull
+// SAFETY: In this library this function name is unique.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn query_size_vmgs(
     path: *const c_char,

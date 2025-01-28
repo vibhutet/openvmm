@@ -1343,7 +1343,7 @@ pub struct OffloadNotSupported;
 
 impl LocalApic {
     /// Returns an object to access APIC registers.
-    pub fn access<'a, T: ApicClient>(&'a mut self, client: &'a mut T) -> LocalApicAccess<'_, T> {
+    pub fn access<'a, T: ApicClient>(&'a mut self, client: &'a mut T) -> LocalApicAccess<'a, T> {
         LocalApicAccess { apic: self, client }
     }
 
@@ -1427,7 +1427,8 @@ impl LocalApic {
         self.hardware_enabled() && !self.x2apic_enabled()
     }
 
-    fn x2apic_enabled(&self) -> bool {
+    /// X2APIC is enabled on this local APIC
+    pub fn x2apic_enabled(&self) -> bool {
         ApicBase::from(self.apic_base).x2apic()
     }
 

@@ -20,6 +20,9 @@ use crate::Error;
 use crate::MessageDecode;
 use crate::MessageEncode;
 use crate::Protobuf;
+use alloc::string::String;
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use thiserror::Error;
 
 /// An opaque protobuf message.
@@ -130,10 +133,15 @@ impl ProtobufAny {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use crate::encode;
     use crate::message::ProtobufAny;
     use crate::message::ProtobufMessage;
+    use crate::tests::as_expect_str;
     use crate::Protobuf;
+    use expect_test::expect;
+    use std::println;
 
     #[test]
     fn test_message() {
@@ -145,8 +153,14 @@ mod tests {
             message
         );
 
+        let expected = expect!([r#"
+            1: varint 5
+            raw: 0805"#]);
+        let actual = encode(ProtobufMessage::new(message));
+        expected.assert_eq(&as_expect_str(&actual));
+
         // Is transparent.
-        assert_eq!(encode(ProtobufMessage::new(message)), encode(message));
+        assert_eq!(actual, encode(message));
     }
 
     #[test]

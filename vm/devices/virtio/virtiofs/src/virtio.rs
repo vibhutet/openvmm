@@ -74,7 +74,7 @@ impl VirtioFsDevice {
         };
 
         // Copy the tag into the config space (truncate it for now if too long).
-        let length = std::cmp::min(tag.as_bytes().len(), config.tag.len());
+        let length = std::cmp::min(tag.len(), config.tag.len());
         config.tag[..length].copy_from_slice(&tag.as_bytes()[..length]);
 
         Self {
@@ -228,7 +228,7 @@ struct VirtioReplySender<'a> {
     mem: &'a GuestMemory,
 }
 
-impl<'a> fuse::ReplySender for VirtioReplySender<'a> {
+impl fuse::ReplySender for VirtioReplySender<'_> {
     fn send(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<()> {
         let mut writer = VirtioPayloadWriter::new(self.mem, &self.work);
         let mut size = 0;

@@ -3,11 +3,21 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "ioperf")]
 pub mod ioperf;
+
+#[cfg(feature = "fuzz_helpers")]
+pub mod protocol;
+#[cfg(feature = "fuzz_helpers")]
+pub mod test_helpers;
+
+#[cfg(not(feature = "fuzz_helpers"))]
 mod protocol;
+#[cfg(not(feature = "fuzz_helpers"))]
+mod test_helpers;
+
 pub mod resolver;
 mod save_restore;
-mod test_helpers;
 
 use crate::ring::gparange::GpnList;
 use crate::ring::gparange::MultiPagedRangeBuf;
@@ -62,6 +72,7 @@ use thiserror::Error;
 use tracing_helpers::ErrorValueExt;
 use unicycle::FuturesUnordered;
 use vmbus_async::queue;
+use vmbus_async::queue::ExternalDataError;
 use vmbus_async::queue::IncomingPacket;
 use vmbus_async::queue::OutgoingPacket;
 use vmbus_async::queue::Queue;
@@ -292,9 +303,9 @@ enum PacketError {
     #[error("Invalid data transfer length")]
     InvalidDataTransferLength,
     #[error("Access error: {0}")]
-    Access(AccessError),
+    Access(#[source] AccessError),
     #[error("Range error")]
-    Range,
+    Range(#[source] ExternalDataError),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -389,9 +400,7 @@ fn parse_packet<T: RingMem>(
                 let request_buf = &mut full_request.request.as_bytes_mut()[..request_size];
                 reader.read(request_buf).map_err(PacketError::Access)?;
 
-                let buf = packet
-                    .read_external_ranges()
-                    .map_err(|_| PacketError::Range)?;
+                let buf = packet.read_external_ranges().map_err(PacketError::Range)?;
 
                 full_request.external_data = Range::new(buf, &full_request.request)
                     .ok_or(PacketError::InvalidDataTransferLength)?;
@@ -1727,12 +1736,22 @@ mod tests {
     use crate::test_helpers::parse_guest_completion;
     use crate::test_helpers::parse_guest_completion_check_flags_status;
     use crate::test_helpers::TestWorker;
-    use disk_ramdisk::RamDisk;
     use pal_async::async_test;
     use pal_async::DefaultDriver;
     use scsi::srb::SrbStatus;
     use test_with_tracing::test;
     use vmbus_channel::connected_async_channels;
+
+    // Discourage `Clone` for `ScsiController` outside the crate, but it is
+    // necessary for testing. The fuzzer also uses `TestWorker`, which needs
+    // a `clone` of the inner state, but is not in this crate.
+    impl Clone for ScsiController {
+        fn clone(&self) -> Self {
+            ScsiController {
+                state: self.state.clone(),
+            }
+        }
+    }
 
     #[async_test]
     async fn test_channel_working(driver: DefaultDriver) {
@@ -1743,7 +1762,7 @@ mod tests {
         let test_guest_mem = GuestMemory::allocate(16384);
         let controller = ScsiController::new();
         let disk = scsidisk::SimpleScsiDisk::new(
-            Arc::new(RamDisk::new(10 * 1024 * 1024, false).unwrap()),
+            disklayer_ram::ram_disk(10 * 1024 * 1024, false).unwrap(),
             Default::default(),
         );
         controller
@@ -1758,7 +1777,7 @@ mod tests {
             .unwrap();
 
         let test_worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem.clone(),
             host,
@@ -1813,7 +1832,7 @@ mod tests {
         let controller = ScsiController::new();
 
         let _worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem,
             host,
@@ -1884,7 +1903,7 @@ mod tests {
         let controller = ScsiController::new();
 
         let _worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem,
             host,
@@ -1934,7 +1953,7 @@ mod tests {
         let controller = ScsiController::new();
 
         let worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem,
             host,
@@ -1974,7 +1993,7 @@ mod tests {
         let controller = ScsiController::new();
 
         let _worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem,
             host,
@@ -2059,7 +2078,7 @@ mod tests {
         let controller = ScsiController::new();
 
         let _worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem,
             host,
@@ -2101,7 +2120,7 @@ mod tests {
         let controller = ScsiController::new();
 
         let test_worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             driver.clone(),
             test_guest_mem.clone(),
             host,
@@ -2148,7 +2167,7 @@ mod tests {
         // Add some disks while the guest is running.
         for lun in 0..4 {
             let disk = scsidisk::SimpleScsiDisk::new(
-                Arc::new(RamDisk::new(10 * 1024 * 1024, false).unwrap()),
+                disklayer_ram::ram_disk(10 * 1024 * 1024, false).unwrap(),
                 Default::default(),
             );
             controller
@@ -2255,10 +2274,10 @@ mod tests {
 
     #[async_test]
     pub async fn test_async_disk(driver: DefaultDriver) {
-        let device = RamDisk::new(64 * 1024, false).unwrap();
+        let device = disklayer_ram::ram_disk(64 * 1024, false).unwrap();
         let controller = ScsiController::new();
         let disk = ScsiControllerDisk::new(Arc::new(scsidisk::SimpleScsiDisk::new(
-            Arc::new(device),
+            device,
             Default::default(),
         )));
         controller
@@ -2282,7 +2301,7 @@ mod tests {
 
         let test_guest_mem = GuestMemory::allocate(16384);
         let worker = TestWorker::start(
-            controller.state.clone(),
+            controller.clone(),
             &driver,
             test_guest_mem.clone(),
             host,

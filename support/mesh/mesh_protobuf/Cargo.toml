@@ -3,13 +3,14 @@
 
 [package]
 name = "mesh_protobuf"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [features]
 default = []
 prost = ["dep:prost", "dep:prost-types", "dep:prost-build"]
 socket2 = ["dep:socket2"]
+std = ["dep:heck", "dep:fs-err"]
 
 [dependencies]
 mesh_derive.workspace = true
@@ -18,8 +19,8 @@ prost = { workspace = true, optional = true }
 prost-types = { workspace = true, optional = true }
 thiserror.workspace = true
 
-fs-err.workspace = true
-heck.workspace = true
+fs-err = { workspace = true, optional = true }
+heck = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 zerocopy.workspace = true
 
@@ -27,7 +28,7 @@ zerocopy.workspace = true
 prost-build = { workspace = true, optional = true }
 
 [dev-dependencies]
-diff.workspace = true
+expect-test.workspace = true
 
 [lints]
 workspace = true

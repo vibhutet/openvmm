@@ -3,12 +3,13 @@
 
 [package]
 name = "guest_crash_device"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
 get_protocol.workspace = true
 get_resources.workspace = true
+guestmem.workspace = true
 guid.workspace = true
 inspect.workspace = true
 mesh.workspace = true

@@ -9,7 +9,7 @@ use super::admin::AdminState;
 use super::admin::NsidConflict;
 use super::IoQueueEntrySizes;
 use crate::queue::DoorbellRegister;
-use disk_backend::SimpleDisk;
+use disk_backend::Disk;
 use futures::FutureExt;
 use futures::StreamExt;
 use futures_concurrency::future::Race;
@@ -17,6 +17,7 @@ use guestmem::GuestMemory;
 use guid::Guid;
 use inspect::Inspect;
 use inspect::InspectMut;
+use mesh::rpc::PendingRpc;
 use mesh::rpc::Rpc;
 use mesh::rpc::RpcSend;
 use pal_async::task::Spawn;
@@ -39,9 +40,9 @@ pub struct NvmeWorkers {
 #[derive(Debug)]
 enum EnableState {
     Disabled,
-    Enabling(mesh::OneshotReceiver<()>),
+    Enabling(PendingRpc<()>),
     Enabled,
-    Resetting(mesh::OneshotReceiver<()>),
+    Resetting(PendingRpc<()>),
 }
 
 impl InspectMut for NvmeWorkers {
@@ -188,11 +189,7 @@ pub struct NvmeControllerClient {
 
 impl NvmeControllerClient {
     /// Adds a namespace.
-    pub async fn add_namespace(
-        &self,
-        nsid: u32,
-        disk: Arc<dyn SimpleDisk>,
-    ) -> Result<(), NsidConflict> {
+    pub async fn add_namespace(&self, nsid: u32, disk: Disk) -> Result<(), NsidConflict> {
         self.send
             .call(CoordinatorRequest::AddNamespace, (nsid, disk))
             .await
@@ -219,7 +216,7 @@ struct Coordinator {
 
 enum CoordinatorRequest {
     EnableAdmin(Rpc<EnableAdminParams, ()>),
-    AddNamespace(Rpc<(u32, Arc<dyn SimpleDisk>), Result<(), NsidConflict>>),
+    AddNamespace(Rpc<(u32, Disk), Result<(), NsidConflict>>),
     RemoveNamespace(Rpc<u32, bool>),
     Inspect(inspect::Deferred),
     ControllerReset(Rpc<(), ()>),

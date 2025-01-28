@@ -13,8 +13,10 @@ use super::MessageEncode;
 use super::RefCell;
 use super::Result;
 use crate::DefaultEncoding;
-use std::marker::PhantomData;
-use std::ops::Range;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::marker::PhantomData;
+use core::ops::Range;
 
 /// Writes a variable-length integer, as defined in the protobuf specification.
 fn write_varint(v: &mut Buf<'_>, mut n: u64) {
@@ -36,7 +38,7 @@ const fn varint_size(n: u64) -> usize {
 }
 
 /// Reads a variable-length integer, advancing `v`.
-fn read_varint(v: &mut &[u8]) -> Result<u64> {
+pub(crate) fn read_varint(v: &mut &[u8]) -> Result<u64> {
     let mut shift = 0;
     let mut r = 0;
     loop {
@@ -116,7 +118,7 @@ impl<'a, R> DecodeState<'a, R> {
 
 struct EncodeState<'a, R> {
     data: Buf<'a>,
-    message_sizes: std::slice::Iter<'a, MessageSize>,
+    message_sizes: core::slice::Iter<'a, MessageSize>,
     resources: &'a mut Vec<R>,
     field_number: u32,
     in_sequence: bool,
@@ -366,7 +368,7 @@ impl<'a> FieldSizer<'a> {
         let index = self.state.message_sizes.len();
         self.state.message_sizes.push(MessageSize::default());
         PreviousSizeParams {
-            index: std::mem::replace(&mut self.state.index, index) as u32,
+            index: core::mem::replace(&mut self.state.index, index) as u32,
             tag_size: self.state.tag_size,
             in_sequence: self.state.in_sequence,
         }
@@ -374,7 +376,7 @@ impl<'a> FieldSizer<'a> {
 
     fn set_cached_message_size(&mut self, prev: PreviousSizeParams) {
         let size = self.state.message_sizes[self.state.index];
-        let index = std::mem::replace(&mut self.state.index, prev.index as usize);
+        let index = core::mem::replace(&mut self.state.index, prev.index as usize);
         let parent_size = &mut self.state.message_sizes[self.state.index];
         let mut len = varint_size(size.len as u64) + size.len;
         if size.num_resources > 0 {
@@ -664,7 +666,7 @@ impl<'a, 'b, R> MessageReader<'a, 'b, R> {
     }
 
     /// Returns an iterator to consume the resources for this message.
-    pub fn take_resources(&mut self) -> impl 'b + ExactSizeIterator<Item = Result<R>> {
+    pub fn take_resources(&mut self) -> impl ExactSizeIterator<Item = Result<R>> + use<'b, R> {
         let state = self.state;
         self.resources.clone().map(move |i| {
             state
@@ -831,7 +833,7 @@ pub struct PackedReader<'a> {
 impl<'a> PackedReader<'a> {
     /// Reads the remaining bytes.
     pub fn bytes(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.data)
+        core::mem::take(&mut self.data)
     }
 
     /// Reads a varint.
@@ -970,8 +972,11 @@ pub fn decode_with<'a, E: MessageDecode<'a, T, R>, T, R>(
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::buffer;
+    use std::eprintln;
 
     #[test]
     fn test_zigzag() {

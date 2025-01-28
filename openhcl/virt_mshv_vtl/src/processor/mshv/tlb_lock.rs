@@ -10,7 +10,7 @@ use hvdef::hypercall::HvInputVtl;
 use hvdef::HvAllArchRegisterName;
 use hvdef::Vtl;
 
-impl<'a> UhProcessor<'a, HypervisorBacked> {
+impl UhProcessor<'_, HypervisorBacked> {
     /// Causes the specified VTL on the current VP to wait on all TLB locks.
     /// This is typically used to synchronize VTL permission changes with
     /// concurrent instruction emulation.
@@ -63,7 +63,8 @@ impl<'a> UhProcessor<'a, HypervisorBacked> {
         let result = self
             .partition
             .hcl
-            .get_vp_register(name, HvInputVtl::CURRENT_VTL);
+            .get_vp_register(name, HvInputVtl::CURRENT_VTL)
+            .expect("failure is a misconfiguration");
         let config = hvdef::HvRegisterVsmVpSecureVtlConfig::from(result.as_u64());
         config.tlb_locked()
     }

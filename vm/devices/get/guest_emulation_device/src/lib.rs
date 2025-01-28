@@ -11,12 +11,13 @@
 #![forbid(unsafe_code)]
 
 pub mod resolver;
-#[doc(hidden)]
+
+#[cfg(feature = "test_utilities")]
 pub mod test_utilities;
 
 use async_trait::async_trait;
 use core::mem::size_of;
-use disk_backend::SimpleDisk;
+use disk_backend::Disk;
 use futures::FutureExt;
 use futures::StreamExt;
 use get_protocol::dps_json::HclSecureBootTemplateId;
@@ -26,7 +27,9 @@ use get_protocol::BatteryStatusNotification;
 use get_protocol::HeaderGeneric;
 use get_protocol::HostNotifications;
 use get_protocol::HostRequests;
+use get_protocol::IgvmAttestRequest;
 use get_protocol::RegisterState;
+use get_protocol::SaveGuestVtl2StateFlags;
 use get_protocol::SecureBootTemplateType;
 use get_protocol::StartVtl0Status;
 use get_protocol::UefiConsoleMode;
@@ -43,11 +46,14 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use mesh::error::RemoteError;
 use mesh::rpc::Rpc;
+use openhcl_attestation_protocol::igvm_attest::get::IgvmAttestAkCertResponseHeader;
+use openhcl_attestation_protocol::igvm_attest::get::IgvmAttestRequestHeader;
+use openhcl_attestation_protocol::igvm_attest::get::IgvmAttestRequestType;
+use openhcl_attestation_protocol::igvm_attest::get::AK_CERT_RESPONSE_HEADER_VERSION;
 use power_resources::PowerRequest;
 use power_resources::PowerRequestClient;
 use scsi_buffers::OwnedRequestBuffers;
 use std::io::IoSlice;
-use std::sync::Arc;
 use task_control::StopTask;
 use thiserror::Error;
 use video_core::FramebufferControl;
@@ -91,6 +97,12 @@ enum Error {
     InvalidFieldValue,
     #[error("large device platform settings v2 is currently unimplemented")]
     LargeDpsV2Unimplemented,
+    #[error("invalid IGVM_ATTEST request")]
+    InvalidIgvmAttestRequest,
+    #[error("unsupported igvm attest request type: {0:?}")]
+    UnsupportedIgvmAttestRequestType(u32),
+    #[error("failed to write to shared memory")]
+    SharedMemoryWriteFailed(#[source] guestmem::GuestMemoryError),
 }
 
 impl From<task_control::Cancelled> for Error {
@@ -177,23 +189,21 @@ pub struct GuestEmulationDevice {
     #[inspect(skip)]
     guest_request_recv: mesh::Receiver<GuestEmulationRequest>,
     #[inspect(skip)]
-    waiting_for_vtl0_start: Vec<mesh::OneshotSender<Result<(), Vtl0StartError>>>,
+    waiting_for_vtl0_start: Vec<Rpc<(), Result<(), Vtl0StartError>>>,
 
     vmgs: Option<VmgsState>,
 
     #[inspect(with = "Option::is_some")]
     save_restore_buf: Option<Vec<u8>>,
+    last_save_restore_buf_len: usize,
 }
 
 #[derive(Inspect)]
 struct VmgsState {
     /// The underlying VMGS disk.
-    disk: Arc<dyn SimpleDisk>,
+    disk: Disk,
     /// Memory for the disk to DMA to/from.
     mem: GuestMemory,
-    /// Memory to buffer data for sending to the guest.
-    #[inspect(skip)]
-    buf: Vec<u8>,
 }
 
 impl GuestEmulationDevice {
@@ -204,7 +214,7 @@ impl GuestEmulationDevice {
         firmware_event_send: Option<mesh::MpscSender<FirmwareEvent>>,
         guest_request_recv: mesh::Receiver<GuestEmulationRequest>,
         framebuffer_control: Option<Box<dyn FramebufferControl>>,
-        vmgs_disk: Option<Arc<dyn SimpleDisk>>,
+        vmgs_disk: Option<Disk>,
     ) -> Self {
         Self {
             config,
@@ -215,10 +225,10 @@ impl GuestEmulationDevice {
             vmgs: vmgs_disk.map(|disk| VmgsState {
                 disk,
                 mem: GuestMemory::allocate(MAX_PAYLOAD_SIZE),
-                buf: vec![0; MAX_PAYLOAD_SIZE],
             }),
             save_restore_buf: None,
             waiting_for_vtl0_start: Vec::new(),
+            last_save_restore_buf_len: 0,
         }
     }
 
@@ -251,9 +261,10 @@ impl SimpleVmbusDevice for GuestEmulationDevice {
     fn open(
         &mut self,
         channel: RawAsyncChannel<GpadlRingMem>,
+        guest_memory: GuestMemory,
     ) -> Result<Self::Runner, ChannelOpenError> {
         let pipe = MessagePipe::new(channel)?;
-        Ok(GedChannel::new(pipe))
+        Ok(GedChannel::new(pipe, guest_memory))
     }
 
     async fn run(
@@ -296,11 +307,16 @@ pub struct GedChannel<T: RingMem = GpadlRingMem> {
     #[inspect(with = "Option::is_some")]
     vtl0_start_report: Option<Result<(), Vtl0StartError>>,
     #[inspect(with = "Option::is_some")]
-    modify: Option<mesh::OneshotSender<Result<(), ModifyVtl2SettingsError>>>,
+    modify: Option<Rpc<(), Result<(), ModifyVtl2SettingsError>>>,
+    // TODO: allow unused temporarily as a follow up change will use it to
+    // implement AK cert renewal.
+    #[inspect(skip)]
+    #[allow(dead_code)]
+    gm: GuestMemory,
 }
 
 struct InProgressSave {
-    response: mesh::OneshotSender<Result<(), SaveRestoreError>>,
+    rpc: Rpc<(), Result<(), SaveRestoreError>>,
     buffer: Vec<u8>,
 }
 
@@ -311,13 +327,14 @@ enum GedState {
 }
 
 impl<T: RingMem + Unpin> GedChannel<T> {
-    fn new(channel: MessagePipe<T>) -> Self {
+    fn new(channel: MessagePipe<T>, guest_memory: GuestMemory) -> Self {
         Self {
             channel,
             save: None,
             state: GedState::Init,
             vtl0_start_report: None,
             modify: None,
+            gm: guest_memory,
         }
     }
 
@@ -391,6 +408,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                     let saved_state_size = buffer.len();
                     if *written >= saved_state_size {
                         self.state = GedState::Ready;
+                        state.last_save_restore_buf_len = saved_state_size;
                         state.save_restore_buf = None;
                         continue;
                     }
@@ -469,22 +487,23 @@ impl<T: RingMem + Unpin> GedChannel<T> {
     ) -> Result<(), Error> {
         match guest_request {
             GuestEmulationRequest::WaitForConnect(rpc) => rpc.handle_sync(|()| ()),
-            GuestEmulationRequest::WaitForVtl0Start(Rpc((), response)) => {
+            GuestEmulationRequest::WaitForVtl0Start(rpc) => {
                 if let Some(result) = self.vtl0_start_report.clone() {
-                    response.send(result);
+                    rpc.complete(result);
                 } else {
-                    state.waiting_for_vtl0_start.push(response);
+                    state.waiting_for_vtl0_start.push(rpc);
                 }
             }
-            GuestEmulationRequest::ModifyVtl2Settings(Rpc(data, response)) => {
+            GuestEmulationRequest::ModifyVtl2Settings(rpc) => {
+                let (data, response) = rpc.split();
                 if self.modify.is_some() {
-                    response.send(Err(ModifyVtl2SettingsError::OperationInProgress));
+                    response.complete(Err(ModifyVtl2SettingsError::OperationInProgress));
                     return Ok(());
                 }
 
                 // TODO: support larger payloads.
                 if data.len() > MAX_PAYLOAD_SIZE {
-                    response.send(Err(ModifyVtl2SettingsError::LargeSettingsNotSupported));
+                    response.complete(Err(ModifyVtl2SettingsError::LargeSettingsNotSupported));
                     return Ok(());
                 }
 
@@ -502,7 +521,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
 
                 self.modify = Some(response);
             }
-            GuestEmulationRequest::SaveGuestVtl2State(Rpc((), response)) => {
+            GuestEmulationRequest::SaveGuestVtl2State(rpc) => {
                 let r = (|| {
                     if self.save.is_some() {
                         return Err(SaveRestoreError::OperationInProgress);
@@ -516,7 +535,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                             get_protocol::GuestNotifications::SAVE_GUEST_VTL2_STATE,
                         ),
                         correlation_id: Guid::ZERO,
-                        capabilities_flags: 0,
+                        capabilities_flags: SaveGuestVtl2StateFlags::new(),
                         timeout_hint_secs: 60,
                     };
 
@@ -529,11 +548,11 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                 match r {
                     Ok(()) => {
                         self.save = Some(InProgressSave {
-                            response,
+                            rpc,
                             buffer: Vec::new(),
                         })
                     }
-                    Err(err) => response.send(Err(err)),
+                    Err(err) => rpc.complete(Err(err)),
                 }
             }
         };
@@ -559,6 +578,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
             HostRequests::GUEST_STATE_PROTECTION_BY_ID => {
                 self.handle_guest_state_protection_by_id()?;
             }
+            HostRequests::IGVM_ATTEST => self.handle_igvm_attest(message_buf)?,
             HostRequests::DEVICE_PLATFORM_SETTINGS_V2 => {
                 self.handle_device_platform_settings_v2(state)?
             }
@@ -625,7 +645,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                 vmgs.disk.sector_count(),
                 vmgs.disk.sector_size().try_into().unwrap(),
                 vmgs.disk.physical_sector_size().try_into().unwrap(),
-                vmgs.buf.len().try_into().unwrap(),
+                MAX_PAYLOAD_SIZE as u32,
             )
         } else {
             get_protocol::VmgsGetDeviceInfoResponse::new(VmgsIoStatus::DEVICE_ERROR, 0, 0, 0, 0)
@@ -661,11 +681,13 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                 )
                 .await
             {
-                Ok(()) => {
-                    let payload = &mut vmgs.buf[..len as usize];
-                    vmgs.mem.read_at(0, payload).unwrap();
-                    (VmgsIoStatus::SUCCESS, &*payload)
-                }
+                Ok(()) => (
+                    VmgsIoStatus::SUCCESS,
+                    &vmgs
+                        .mem
+                        .inner_buf_mut()
+                        .expect("memory should not be aliased")[..len as usize],
+                ),
                 Err(err) => {
                     tracelimit::error_ratelimited!(
                         error = &err as &dyn std::error::Error,
@@ -787,6 +809,51 @@ impl<T: RingMem + Unpin> GedChannel<T> {
         Ok(())
     }
 
+    /// Stub implementation that simulates the behavior of GED and the host agent.
+    /// Used only for test scenarios such as VMM tests.
+    fn handle_igvm_attest(&mut self, message_buf: &[u8]) -> Result<(), Error> {
+        let request =
+            IgvmAttestRequest::read_from_prefix(message_buf).ok_or(Error::MessageTooSmall)?;
+
+        // Request sanitization (match GED behavior)
+        if request.agent_data_length as usize > request.agent_data.len()
+            || request.report_length as usize > request.report.len()
+            || request.number_gpa as usize > get_protocol::IGVM_ATTEST_MSG_MAX_SHARED_GPA
+        {
+            Err(Error::InvalidIgvmAttestRequest)?
+        }
+
+        let request_payload = IgvmAttestRequestHeader::read_from_prefix(&request.report)
+            .ok_or(Error::MessageTooSmall)?;
+
+        let response = match request_payload.request_type {
+            IgvmAttestRequestType::AK_CERT_REQUEST => {
+                let data = vec![0xab; 2500];
+                let header = IgvmAttestAkCertResponseHeader {
+                    data_size: (data.len() + size_of::<IgvmAttestAkCertResponseHeader>()) as u32,
+                    version: AK_CERT_RESPONSE_HEADER_VERSION,
+                };
+                let payload = [header.as_bytes(), &data].concat();
+
+                self.gm
+                    .write_at(request.shared_gpa[0], &payload)
+                    .map_err(Error::SharedMemoryWriteFailed)?;
+
+                get_protocol::IgvmAttestResponse {
+                    message_header: HeaderGeneric::new(HostRequests::IGVM_ATTEST),
+                    length: payload.len() as u32,
+                }
+            }
+            ty => return Err(Error::UnsupportedIgvmAttestRequestType(ty.0)),
+        };
+
+        self.channel
+            .try_send(response.as_bytes())
+            .map_err(Error::Vmbus)?;
+
+        Ok(())
+    }
+
     fn handle_save_guest_vtl2_state(
         &mut self,
         message_buf: &[u8],
@@ -835,7 +902,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
             if r.is_ok() {
                 state.save_restore_buf = Some(save.buffer);
             }
-            save.response.send(r);
+            save.rpc.complete(r);
         }
         Ok(())
     }
@@ -1053,7 +1120,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
             _ => return Err(Error::InvalidFieldValue),
         };
         for response in state.waiting_for_vtl0_start.drain(..) {
-            response.send(result.clone());
+            response.complete(result.clone());
         }
         self.vtl0_start_report = Some(result);
         Ok(())
@@ -1109,7 +1176,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
             }
             _ => return Err(Error::InvalidFieldValue),
         };
-        modify.send(r);
+        modify.complete(r);
         Ok(())
     }
 
@@ -1199,6 +1266,7 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                     watchdog_enabled: false,
                     always_relay_host_mmio: false,
                     imc_enabled: false,
+                    cxl_memory_enabled: false,
                 },
                 dynamic: get_protocol::dps_json::HclDevicePlatformSettingsV2Dynamic {
                     is_servicing_scenario: state.save_restore_buf.is_some(),

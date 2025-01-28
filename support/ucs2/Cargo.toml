@@ -3,15 +3,10 @@
 
 [package]
 name = "ucs2"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
-[features]
-mesh = ["mesh_protobuf"]
-
 [dependencies]
-mesh_protobuf = { workspace = true, optional = true }
-
 thiserror.workspace = true
 
 [lints]

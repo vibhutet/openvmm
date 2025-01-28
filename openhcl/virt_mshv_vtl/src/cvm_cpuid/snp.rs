@@ -150,7 +150,7 @@ impl CpuidArchInitializer for SnpCpuidInitializer {
                     .with_ibpb(true)
                     .with_ibrs(true)
                     .with_stibp(true)
-                    .with_mdd(true)
+                    .with_ssbd(true)
                     .with_stibp_always_on(true)
                     .with_efer_lmsle_unsupported(true)
                     .with_psfd(true)
@@ -402,7 +402,7 @@ pub struct SnpCpuidIterator<'a> {
     index: CpuidPageIndex,
 }
 
-impl<'a> Iterator for SnpCpuidIterator<'a> {
+impl Iterator for SnpCpuidIterator<'_> {
     type Item = ParsedCpuidEntry;
 
     fn next(&mut self) -> Option<Self::Item> {

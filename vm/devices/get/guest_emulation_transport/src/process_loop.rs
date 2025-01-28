@@ -19,6 +19,9 @@ use guid::Guid;
 use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
+use mesh::rpc::Rpc;
+use mesh::rpc::RpcError;
+use mesh::rpc::TryRpcSend;
 use mesh::RecvError;
 use parking_lot::Mutex;
 use std::cmp::min;
@@ -32,6 +35,7 @@ use thiserror::Error;
 use underhill_config::Vtl2SettingsErrorInfo;
 use underhill_config::Vtl2SettingsErrorInfoVec;
 use unicycle::FuturesUnordered;
+use user_driver::vfio::VfioDmaBuffer;
 use vmbus_async::async_dgram::AsyncRecvExt;
 use vmbus_async::async_dgram::AsyncSendExt;
 use vmbus_async::pipe::MessagePipe;
@@ -82,12 +86,10 @@ pub(crate) enum FatalError {
     Vtl2SettingsErrorInfoJson(#[source] serde_json::error::Error),
     #[error("received too many guest notifications of kind {0:?} prior to downstream worker init")]
     TooManyGuestNotifications(get_protocol::GuestNotifications),
-    #[error("failed to make the IgvmAttest request because shared memory is unavailable")]
-    SharedMemoryUnavailable,
-    #[error("failed to allocated shared memory")]
-    SharedMemoryAllocationError(#[source] shared_pool_alloc::SharedPoolOutOfMemory),
-    #[error("failed to read the `IGVM_ATTEST` response from shared memory")]
-    ReadSharedMemory(#[source] guestmem::GuestMemoryError),
+    #[error("failed to create IgvmAttest request because the gpa allocator is unavailable")]
+    GpaAllocatorUnavailable,
+    #[error("failed to allocate memory for attestation request")]
+    GpaMemoryAllocationError(#[source] anyhow::Error),
     #[error("failed to deserialize the asynchronous `IGVM_ATTEST` response")]
     DeserializeIgvmAttestResponse,
     #[error("malformed `IGVM_ATTEST` response - reported size {response_size} was larger than maximum size {maximum_size}")]
@@ -144,6 +146,8 @@ pub(crate) mod msg {
     use chipset_resources::battery::HostBatteryUpdate;
     use guid::Guid;
     use mesh::rpc::Rpc;
+    use std::sync::Arc;
+    use user_driver::vfio::VfioDmaBuffer;
     use vpci::bus_control::VpciBusEvent;
 
     #[derive(Debug)]
@@ -157,10 +161,10 @@ pub(crate) mod msg {
     pub(crate) struct IgvmAttestRequestData {
         pub(crate) agent_data: Vec<u8>,
         pub(crate) report: Vec<u8>,
+        pub(crate) response_buffer_len: usize,
     }
 
     /// A list specifying control messages to send to the process loop.
-    #[derive(Debug)]
     pub(crate) enum Msg {
         // GET infrastructure - not part of the GET protocol itself.
         // No direct interaction with the host.
@@ -172,12 +176,8 @@ pub(crate) mod msg {
         FlushWrites(Rpc<(), ()>),
         /// Inspect the state of the process loop.
         Inspect(inspect::Deferred),
-        /// Store the shared memory allocator and guest memory for later use by
-        /// IGVM attestation.
-        SetupSharedMemoryAllocator(
-            shared_pool_alloc::SharedPoolAllocator,
-            guestmem::GuestMemory,
-        ),
+        /// Store the gpa allocator to be used for attestation.
+        SetGpaAllocator(Arc<dyn VfioDmaBuffer>),
 
         // Late bound receivers for Guest Notifications
         /// Take the late-bound GuestRequest receiver for Generation Id updates.
@@ -401,6 +401,15 @@ impl<const MAX_SIZE: usize, T: Send + 'static> BufferedSender<MAX_SIZE, T> {
     }
 }
 
+impl<const MAX_SIZE: usize, T: Send + 'static> TryRpcSend for &mut BufferedSender<MAX_SIZE, T> {
+    type Message = T;
+    type Error = BufferedSenderFull;
+
+    fn try_send_rpc(self, message: Self::Message) -> Result<(), Self::Error> {
+        self.send(message)
+    }
+}
+
 /// A variant of `Option<mesh::Sender<T>>` for late-bound guest notification
 /// consumers that buffers a fixed-number of messages during the window between
 /// GET init and worker startup.
@@ -471,8 +480,7 @@ pub(crate) struct ProcessLoop<T: RingMem> {
     #[inspect(skip)]
     igvm_attest_read_send: mesh::Sender<Vec<u8>>,
     #[inspect(skip)]
-    shared_pool_allocator: Option<Arc<shared_pool_alloc::SharedPoolAllocator>>,
-    shared_guest_memory: Option<Arc<guestmem::GuestMemory>>,
+    gpa_allocator: Option<Arc<dyn VfioDmaBuffer>>,
     stats: Stats,
 
     guest_notification_listeners: GuestNotificationListeners,
@@ -512,7 +520,7 @@ struct GuestNotificationListeners {
 // pair of notifications that don't really act like "notifications" for the
 // foreseeable future...
 enum GuestNotificationResponse {
-    ModifyVtl2Settings(Result<Result<(), Vec<Vtl2SettingsErrorInfo>>, RecvError>),
+    ModifyVtl2Settings(Result<(), RpcError<Vec<Vtl2SettingsErrorInfo>>>),
 }
 
 #[derive(Default, Inspect)]
@@ -557,7 +565,7 @@ struct PipeChannels {
 
 enum WriteRequest {
     Message(Vec<u8>),
-    Flush(mesh::OneshotSender<()>),
+    Flush(Rpc<(), ()>),
 }
 
 impl HostRequestPipeAccess {
@@ -620,6 +628,22 @@ impl HostRequestPipeAccess {
             get_protocol::HeaderHostRequest::read_from_prefix(data.as_bytes()).unwrap();
         self.recv_response_fixed_size(req_header.message_id).await
     }
+
+    /// Sends a fail notification to the host.
+    ///
+    /// This function does not wait for a response from the host.
+    /// It is specifically designed for scenarios where the host does not send any response.
+    /// One of such scenario is the save failure, where host does not send any response.
+    ///
+    /// In the future, GED notifications for failures need to be added.
+    /// This will require updates to both the host and openHCL.
+    async fn send_failed_save_state<T: AsBytes + ?Sized>(
+        &mut self,
+        data: &T,
+    ) -> Result<(), FatalError> {
+        self.send_message(data.as_bytes().to_vec());
+        Ok(())
+    }
 }
 
 impl<T: RingMem> ProcessLoop<T> {
@@ -652,8 +676,7 @@ impl<T: RingMem> ProcessLoop<T> {
                 vpci: HashMap::new(),
                 battery_status: GuestNotificationSender::new(),
             },
-            shared_pool_allocator: None,
-            shared_guest_memory: None,
+            gpa_allocator: None,
         }
     }
 
@@ -785,7 +808,7 @@ impl<T: RingMem> ProcessLoop<T> {
                         }
                         match self.write_recv.recv().await.unwrap() {
                             WriteRequest::Message(message) => outgoing = message,
-                            WriteRequest::Flush(send) => send.send(()),
+                            WriteRequest::Flush(send) => send.complete(()),
                         }
                     }
                 }
@@ -958,7 +981,7 @@ impl<T: RingMem> ProcessLoop<T> {
     /// for its response.
     fn push_basic_host_request_handler<Req, I, Resp>(
         &mut self,
-        req: mesh::rpc::Rpc<I, Resp>,
+        req: Rpc<I, Resp>,
         f: impl 'static + Send + FnOnce(I) -> Req,
     ) where
         Req: AsBytes + 'static + Send + Sync,
@@ -978,17 +1001,16 @@ impl<T: RingMem> ProcessLoop<T> {
         match message {
             // GET infrastructure - not part of the GET protocol itself.
             // No direct interaction with the host.
-            Msg::FlushWrites(mesh::rpc::Rpc((), response)) => {
+            Msg::FlushWrites(rpc) => {
                 self.pipe_channels
                     .message_send
-                    .send(WriteRequest::Flush(response));
+                    .send(WriteRequest::Flush(rpc));
             }
             Msg::Inspect(req) => {
                 req.inspect(self);
             }
-            Msg::SetupSharedMemoryAllocator(shared_pool_allocator, shared_guest_memory) => {
-                self.shared_pool_allocator = Some(Arc::new(shared_pool_allocator));
-                self.shared_guest_memory = Some(Arc::new(shared_guest_memory));
+            Msg::SetGpaAllocator(gpa_allocator) => {
+                self.gpa_allocator = Some(gpa_allocator);
             }
 
             // Late bound receivers for Guest Notifications
@@ -1068,17 +1090,11 @@ impl<T: RingMem> ProcessLoop<T> {
                 self.push_basic_host_request_handler(req, |()| get_protocol::TimeRequest::new());
             }
             Msg::IgvmAttest(req) => {
-                let shared_pool_allocator = self.shared_pool_allocator.clone();
-                let shared_guest_memory = self.shared_guest_memory.clone();
+                let shared_pool_allocator = self.gpa_allocator.clone();
 
                 self.push_igvm_attest_request_handler(|access| {
                     req.handle_must_succeed(|request| {
-                        request_igvm_attest(
-                            access,
-                            *request,
-                            shared_pool_allocator,
-                            shared_guest_memory,
-                        )
+                        request_igvm_attest(access, *request, shared_pool_allocator)
                     })
                 });
             }
@@ -1144,9 +1160,10 @@ impl<T: RingMem> ProcessLoop<T> {
             Msg::SendServicingState(req) => self.push_host_request_handler(move |access| {
                 req.handle_must_succeed(|data| request_send_servicing_state(access, data))
             }),
-            Msg::CompleteStartVtl0(mesh::rpc::Rpc(input, res)) => {
+            Msg::CompleteStartVtl0(rpc) => {
+                let (input, res) = rpc.split();
                 self.complete_start_vtl0(input)?;
-                res.send(());
+                res.complete(());
             }
 
             // Host Notifications (don't require a response)
@@ -1306,7 +1323,7 @@ impl<T: RingMem> ProcessLoop<T> {
                 correlation_id: notification_header.correlation_id,
                 deadline: std::time::Instant::now()
                     + std::time::Duration::from_secs(notification_header.timeout_hint_secs as u64),
-                capabilities_flags: notification_header.capabilities_flags.into(),
+                capabilities_flags: notification_header.capabilities_flags,
             })
             .map_err(|_| {
                 FatalError::TooManyGuestNotifications(
@@ -1380,17 +1397,13 @@ impl<T: RingMem> ProcessLoop<T> {
         vtl2_settings_buf: Vec<u8>,
         kind: get_protocol::GuestNotifications,
     ) -> Result<(), FatalError> {
-        let (result_send, result_recv) = mesh::oneshot();
-
-        let req = ModifyVtl2SettingsRequest(mesh::rpc::Rpc(vtl2_settings_buf, result_send));
-        let res = result_recv
+        let res = self
+            .guest_notification_listeners
+            .vtl2_settings
+            .try_call_failable(ModifyVtl2SettingsRequest, vtl2_settings_buf)
+            .map_err(|_| FatalError::TooManyGuestNotifications(kind))?
             .map(GuestNotificationResponse::ModifyVtl2Settings)
             .boxed();
-
-        self.guest_notification_listeners
-            .vtl2_settings
-            .send(req)
-            .map_err(|_| FatalError::TooManyGuestNotifications(kind))?;
 
         self.guest_notification_responses.push(res);
         Ok(())
@@ -1451,13 +1464,14 @@ impl<T: RingMem> ProcessLoop<T> {
 
     fn complete_modify_vtl2_settings(
         &mut self,
-        result: Result<Result<(), Vec<Vtl2SettingsErrorInfo>>, RecvError>,
+        result: Result<(), RpcError<Vec<Vtl2SettingsErrorInfo>>>,
     ) -> Result<(), FatalError> {
-        let errors = result.unwrap_or_else(|err| {
-            Err(vec![Vtl2SettingsErrorInfo::new(
+        let errors = result.map_err(|err| match err {
+            RpcError::Call(err) => err,
+            RpcError::Channel(err) => vec![Vtl2SettingsErrorInfo::new(
                 underhill_config::Vtl2SettingsErrorCode::InternalFailure,
                 err.to_string(),
-            )])
+            )],
         });
 
         let (status, errors_json) = match errors {
@@ -1680,9 +1694,9 @@ async fn request_send_servicing_state(
     let saved_state_buf = match result {
         Ok(saved_state_buf) => saved_state_buf,
         Err(_err) => {
-            // TODO: send error to host.
+            // Sends a failure notification to host.
             return access
-                .send_request_fixed_size(&get_protocol::SaveGuestVtl2StateRequest::new(
+                .send_failed_save_state(&get_protocol::SaveGuestVtl2StateRequest::new(
                     get_protocol::GuestVtl2SaveRestoreStatus::FAILURE,
                 ))
                 .await
@@ -1809,33 +1823,24 @@ async fn request_saved_state(
 async fn request_igvm_attest(
     mut access: HostRequestPipeAccess,
     request: msg::IgvmAttestRequestData,
-    shared_pool_allocator: Option<Arc<shared_pool_alloc::SharedPoolAllocator>>,
-    shared_guest_memory: Option<Arc<guestmem::GuestMemory>>,
+    gpa_allocator: Option<Arc<dyn VfioDmaBuffer>>,
 ) -> Result<Result<Vec<u8>, IgvmAttestError>, FatalError> {
-    const ALLOCATED_SHARED_MEMORY_SIZE: usize =
-        get_protocol::IGVM_ATTEST_MSG_SHARED_GPA * hvdef::HV_PAGE_SIZE_USIZE;
+    let allocator = gpa_allocator.ok_or(FatalError::GpaAllocatorUnavailable)?;
+    let dma_size = request.response_buffer_len;
+    let mem = allocator
+        .create_dma_buffer(dma_size)
+        .map_err(FatalError::GpaMemoryAllocationError)?;
 
-    let (Some(shared_pool_allocator), Some(shared_guest_memory)) =
-        (&shared_pool_allocator, &shared_guest_memory)
-    else {
-        Err(FatalError::SharedMemoryUnavailable)?
-    };
-
-    // Allocate shared memory.
-    let size_pages = std::num::NonZeroU64::new(get_protocol::IGVM_ATTEST_MSG_SHARED_GPA as u64)
-        .expect("is nonzero");
-    let handle = shared_pool_allocator
-        .alloc(size_pages, "igvm_attest".to_string())
-        .map_err(FatalError::SharedMemoryAllocationError)?;
     // Host expects the vTOM bit to be stripped
-    let base_pfn = handle.base_pfn_without_bias();
-    let pfns = base_pfn..base_pfn + handle.size_pages();
-    let allocated_gpa = pfns
-        .map(|pfn| pfn * hvdef::HV_PAGE_SIZE)
+    let pfn_bias = mem.pfn_bias();
+    let gpas = mem
+        .pfns()
+        .iter()
+        .map(|pfn| (pfn & !(pfn_bias)) * hvdef::HV_PAGE_SIZE)
         .collect::<Vec<_>>();
 
     let mut shared_gpa = [0u64; get_protocol::IGVM_ATTEST_MSG_MAX_SHARED_GPA];
-    shared_gpa[..allocated_gpa.len()].copy_from_slice(&allocated_gpa);
+    shared_gpa[..gpas.len()].copy_from_slice(&gpas);
 
     let request =
         match prepare_igvm_attest_request(shared_gpa, &request.agent_data, &request.report) {
@@ -1855,17 +1860,15 @@ async fn request_igvm_attest(
     let response_length = response.length as usize;
     if response_length == get_protocol::IGVM_ATTEST_VMWP_GENERIC_ERROR_CODE {
         return Ok(Err(IgvmAttestError::IgvmAgentGenericError));
-    } else if response_length > ALLOCATED_SHARED_MEMORY_SIZE {
+    } else if response_length > dma_size {
         Err(FatalError::InvalidIgvmAttestResponseSize {
             response_size: response_length,
-            maximum_size: ALLOCATED_SHARED_MEMORY_SIZE,
+            maximum_size: dma_size,
         })?
     }
 
-    let mut buffer = vec![0u8; ALLOCATED_SHARED_MEMORY_SIZE];
-    shared_guest_memory
-        .read_at(request.shared_gpa[0], &mut buffer)
-        .map_err(FatalError::ReadSharedMemory)?;
+    let mut buffer = vec![0u8; dma_size];
+    mem.read_at(0, &mut buffer);
 
     buffer.truncate(response_length);
 

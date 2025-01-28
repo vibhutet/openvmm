@@ -77,7 +77,7 @@ impl IntoPipeline for CheckinGatesCli {
                     pipeline
                         .gh_set_pr_triggers(GhPrTriggers {
                             branches,
-                            ..Default::default()
+                            ..GhPrTriggers::new_draftable()
                         })
                         .gh_set_name("[flowey] OpenVMM PR");
                 }
@@ -201,7 +201,6 @@ impl IntoPipeline for CheckinGatesCli {
                 pub_rustdoc_linux,
             ),
         ] {
-            let deny_warnings = !matches!(backend_hint, PipelineBackendHint::Local);
             let job = pipeline
                 .new_job(
                     platform,
@@ -211,9 +210,6 @@ impl IntoPipeline for CheckinGatesCli {
                 .gh_set_pool(crate::pipelines_shared::gh_pools::default_x86_pool(
                     platform,
                 ))
-                .dep_on(|_ctx| {
-                    flowey_lib_hvlite::build_rustdoc::Request::SetDenyWarnings(deny_warnings)
-                })
                 .dep_on(
                     |ctx| flowey_lib_hvlite::_jobs::build_and_publish_rustdoc::Params {
                         target_triple: target.as_triple(),
@@ -342,6 +338,8 @@ impl IntoPipeline for CheckinGatesCli {
                 pipeline.new_artifact(format!("{arch_tag}-windows-vmgs_lib"));
             let (pub_vmgstool, _use_vmgstool) =
                 pipeline.new_artifact(format!("{arch_tag}-windows-vmgstool"));
+            let (pub_hypestv, _use_hypestv) =
+                pipeline.new_artifact(format!("{arch_tag}-windows-hypestv"));
             let (pub_ohcldiag_dev, _use_ohcldiag_dev) =
                 pipeline.new_artifact(format!("{arch_tag}-windows-ohcldiag-dev"));
 
@@ -363,6 +361,17 @@ impl IntoPipeline for CheckinGatesCli {
                         profile: CommonProfile::from_release(release),
                         with_crypto: true,
                         artifact_dir: ctx.publish_artifact(pub_vmgstool),
+                        done: ctx.new_done_handle(),
+                    },
+                )
+                .dep_on(
+                    |ctx| flowey_lib_hvlite::_jobs::build_and_publish_hypestv::Params {
+                        target: CommonTriple::Common {
+                            arch,
+                            platform: CommonPlatform::WindowsMsvc,
+                        },
+                        profile: CommonProfile::from_release(release),
+                        artifact_dir: ctx.publish_artifact(pub_hypestv),
                         done: ctx.new_done_handle(),
                     },
                 )
@@ -929,10 +938,19 @@ impl IntoPipeline for CheckinGatesCli {
                 if matches!(
                     target.as_triple().operating_system,
                     target_lexicon::OperatingSystem::Linux
-                ) {
+                ) || matches!(target.common_arch(), Some(CommonArch::Aarch64))
+                {
                     // - OpenHCL is not supported on KVM
+                    // - OpenHCL is not currently supported on our ARM64 test runners
+                    expr = format!("{expr} and not test(openhcl)")
+                }
+
+                if matches!(
+                    target.as_triple().operating_system,
+                    target_lexicon::OperatingSystem::Linux
+                ) {
                     // - No legal way to obtain gen1 pcat blobs on non-msft linux machines
-                    expr = format!("{expr} and not test(openhcl) and not test(pcat_x64)")
+                    expr = format!("{expr} and not test(pcat_x64)")
                 }
 
                 Some(expr)
@@ -1015,7 +1033,7 @@ impl IntoPipeline for CheckinGatesCli {
                     FlowPlatform::Linux(FlowPlatformLinuxDistro::Ubuntu),
                 ))
                 // always run this job, regardless whether or not any previous jobs failed
-                .gh_dangerous_override_if("${{ always() }}")
+                .gh_dangerous_override_if("always() && github.event.pull_request.draft == false")
                 .gh_dangerous_global_env_var("ANY_JOBS_FAILED", "${{ contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'failure') }}")
                 .dep_on(|ctx| flowey_lib_hvlite::_jobs::all_good_job::Params {
                     did_fail_env_var: "ANY_JOBS_FAILED".into(),

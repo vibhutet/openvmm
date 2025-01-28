@@ -11,9 +11,9 @@ use crate::protobuf::MessageSizer;
 use crate::protobuf::MessageWriter;
 use crate::FieldEncode;
 use crate::MessageEncode;
+use alloc::slice;
 use core::marker::PhantomData;
-use std::mem::MaybeUninit;
-use std::slice;
+use core::mem::MaybeUninit;
 
 impl<T, R> MessageEncode<T, R> for TableEncoder
 where
@@ -42,7 +42,7 @@ where
                 T::NUMBERS,
                 T::ENCODERS,
                 T::OFFSETS,
-                std::ptr::from_mut(item).cast::<u8>(),
+                core::ptr::from_mut(item).cast::<u8>(),
                 sizer,
             );
         }
@@ -80,7 +80,7 @@ where
                 T::NUMBERS,
                 T::ENCODERS,
                 T::OFFSETS,
-                std::ptr::from_mut(item).cast::<u8>(),
+                core::ptr::from_mut(item).cast::<u8>(),
                 sizer,
             );
         }
@@ -196,19 +196,7 @@ unsafe fn write_fields_inline<R>(
         // through `base` after this returns.
         unsafe {
             let ptr = base.add(offset);
-            match encoder.decode() {
-                Ok(vtable) => (vtable.write_fn)(ptr, writer),
-                Err(table) => {
-                    write_message_by_ptr(
-                        table.count,
-                        table.numbers,
-                        table.encoders,
-                        table.offsets,
-                        ptr,
-                        writer,
-                    );
-                }
-            }
+            encoder.write_field(ptr, writer);
         }
     }
 }
@@ -318,19 +306,7 @@ unsafe fn compute_size_fields_inline<R>(
         // compatible with this encoder.
         unsafe {
             let ptr = base.add(offset);
-            match encoder.decode::<R>() {
-                Ok(vtable) => (vtable.compute_size_fn)(ptr, sizer),
-                Err(table) => {
-                    compute_size_message_by_ptr::<R>(
-                        table.count,
-                        table.numbers,
-                        table.encoders,
-                        table.offsets,
-                        ptr,
-                        sizer,
-                    );
-                }
-            }
+            encoder.compute_size_field::<R>(ptr, sizer);
         }
     }
 }
@@ -367,7 +343,7 @@ impl<T, R> EncoderEntry<T, R> {
     pub(crate) const fn custom<E: FieldEncode<T, R>>() -> Self {
         Self(
             ErasedEncoderEntry(
-                std::ptr::from_ref(
+                core::ptr::from_ref(
                     const {
                         &StaticEncoderVtable {
                             write_fn: write_field_dyn::<T, R, E>,
@@ -388,7 +364,7 @@ impl<T, R> EncoderEntry<T, R> {
     {
         Self(
             ErasedEncoderEntry(
-                std::ptr::from_ref(
+                core::ptr::from_ref(
                     const {
                         &EncoderTable {
                             count: T::NUMBERS.len(),
@@ -416,8 +392,15 @@ impl<T, R> EncoderEntry<T, R> {
 //
 // Internally, this is a pointer to either a vtable or a table.
 // The low bit is used to distinguish between the two.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub struct ErasedEncoderEntry(*const ());
+
+// SAFETY: the entry represents a set of integers and function pointers, which
+// have no cross-thread constraints.
+unsafe impl Send for ErasedEncoderEntry {}
+// SAFETY: the entry represents a set of integers and function pointers, which
+// have no cross-thread constraints.
+unsafe impl Sync for ErasedEncoderEntry {}
 
 const ENTRY_IS_TABLE: usize = 1;
 
@@ -439,6 +422,56 @@ impl ErasedEncoderEntry {
                     .0
                     .wrapping_byte_sub(ENTRY_IS_TABLE)
                     .cast::<EncoderTable>())
+            }
+        }
+    }
+
+    /// Writes a value to a field using the encoder, taking ownership of `field`.
+    ///
+    /// # Safety
+    /// The caller must ensure that `field` points to a valid object of type `T`, and
+    /// that the encoder is correct for `T` and `R`.
+    pub unsafe fn write_field<R>(&self, field: *mut u8, writer: FieldWriter<'_, '_, R>) {
+        // SAFETY: caller guarantees this encoder is correct for `T` and `R` and
+        // that `field` points to a valid object of type `T`.
+        unsafe {
+            match self.decode::<R>() {
+                Ok(vtable) => (vtable.write_fn)(field, writer),
+                Err(table) => {
+                    write_message_by_ptr(
+                        table.count,
+                        table.numbers,
+                        table.encoders,
+                        table.offsets,
+                        field,
+                        writer,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Computes the size of a field using the encoder.
+    ///
+    /// # Safety
+    /// The caller must ensure that `field` points to a valid object of type `T`, and
+    /// that the encoder is correct for `T` and `R`.
+    pub unsafe fn compute_size_field<R>(&self, field: *mut u8, sizer: FieldSizer<'_>) {
+        // SAFETY: caller guarantees this encoder is correct for `T` and `R` and
+        // that `field` points to a valid object of type `T`.
+        unsafe {
+            match self.decode::<R>() {
+                Ok(vtable) => (vtable.compute_size_fn)(field, sizer),
+                Err(table) => {
+                    compute_size_message_by_ptr::<R>(
+                        table.count,
+                        table.numbers,
+                        table.encoders,
+                        table.offsets,
+                        field,
+                        sizer,
+                    );
+                }
             }
         }
     }

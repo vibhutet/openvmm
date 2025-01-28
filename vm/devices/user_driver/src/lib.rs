@@ -4,7 +4,7 @@
 //! Infrastructure for implementing PCI drivers in user mode.
 
 // UNSAFETY: Manual memory management around buffers and mmap.
-#![allow(unsafe_code)]
+#![expect(unsafe_code)]
 
 use inspect::Inspect;
 use interrupt::DeviceInterrupt;
@@ -50,6 +50,8 @@ pub trait DeviceBacking: 'static + Send + Inspect {
 
 /// Access to device registers.
 pub trait DeviceRegisterIo: Send + Sync {
+    /// Returns the length of the register space.
+    fn len(&self) -> usize;
     /// Reads a `u32` register.
     fn read_u32(&self, offset: usize) -> u32;
     /// Reads a `u64` register.
@@ -61,5 +63,8 @@ pub trait DeviceRegisterIo: Send + Sync {
 }
 
 pub trait HostDmaAllocator: Send + Sync {
+    /// Allocate a new block using default allocation strategy.
     fn allocate_dma_buffer(&self, len: usize) -> anyhow::Result<MemoryBlock>;
+    /// Attach to a previously allocated memory block with contiguous PFNs.
+    fn attach_dma_buffer(&self, len: usize, base_pfn: u64) -> anyhow::Result<MemoryBlock>;
 }

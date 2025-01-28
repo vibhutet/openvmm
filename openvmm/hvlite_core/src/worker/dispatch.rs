@@ -12,7 +12,7 @@ use cfg_if::cfg_if;
 use chipset_device_resources::IRQ_LINE_SET;
 use debug_ptr::DebugPtr;
 use disk_backend::resolve::ResolveDiskParameters;
-use disk_backend::SimpleDisk;
+use disk_backend::Disk;
 use firmware_uefi::UefiCommandSet;
 use floppy_resources::FloppyDiskConfig;
 use futures::executor::block_on;
@@ -59,7 +59,6 @@ use memory_range::MemoryRange;
 use mesh::error::RemoteError;
 use mesh::payload::message::ProtobufMessage;
 use mesh::payload::Protobuf;
-use mesh::rpc::Rpc;
 use mesh::MeshPayload;
 use mesh_worker::Worker;
 use mesh_worker::WorkerId;
@@ -245,7 +244,7 @@ async fn open_simple_disk(
     resolver: &ResourceResolver,
     disk_type: Resource<DiskHandleKind>,
     read_only: bool,
-) -> anyhow::Result<Arc<dyn SimpleDisk>> {
+) -> anyhow::Result<Disk> {
     let disk = resolver
         .resolve(
             disk_type,
@@ -507,7 +506,7 @@ struct LoadedVmInner {
     vmbus_server: Option<VmbusServerHandle>,
     vtl2_vmbus_server: Option<VmbusServerHandle>,
     #[cfg(windows)]
-    _vmbus_handle: Option<std::os::windows::io::OwnedHandle>,
+    _vmbus_proxy: Option<vmbus_server::ProxyIntegration>,
     #[cfg(windows)]
     _kernel_vmnics: Vec<vmswitch::kernel::KernelVmNic>,
     memory_cfg: MemoryConfig,
@@ -1351,12 +1350,10 @@ impl InitializedVm {
                     .context("failed to open floppy disk")?;
                 tracing::trace!("floppy opened based on config into DriveRibbon");
 
-                let floppy = floppy::FloppyMedia::new(disk);
-
                 if index == 0 {
-                    pri_drives.push(floppy);
+                    pri_drives.push(disk);
                 } else if index == 1 {
-                    sec_drives.push(floppy)
+                    sec_drives.push(disk)
                 } else {
                     tracing::error!("more than 2 floppy controllers are not supported");
                     break;
@@ -1611,7 +1608,7 @@ impl InitializedVm {
         let mut scsi_devices = Vec::new();
         let mut vtl0_hvsock_relay = None;
         #[cfg(windows)]
-        let mut vmbus_handle = None;
+        let mut vmbus_proxy = None;
         #[cfg(windows)]
         let mut kernel_vmnics = Vec::new();
         let mut vpci_serial: Option<virtio_serial::SerialIo> = None;
@@ -1635,7 +1632,11 @@ impl InitializedVm {
                 let vmbus_driver = driver_source.simple();
                 let vtl2_vmbus = VmbusServer::builder(&vmbus_driver, synic.clone(), gm.clone())
                     .vtl(Vtl::Vtl2)
-                    .max_version(vtl2_vmbus_cfg.vmbus_max_version)
+                    .max_version(
+                        vtl2_vmbus_cfg
+                            .vmbus_max_version
+                            .map(vmbus_core::MaxVersionInfo::new),
+                    )
                     .hvsock_notify(Some(vtl2_hvsock_channel.server_half))
                     .external_requests(Some(server_request_recv))
                     .enable_mnf(true)
@@ -1670,7 +1671,11 @@ impl InitializedVm {
                 .hvsock_notify(Some(hvsock_channel.server_half))
                 .external_server(vtl2_request_send)
                 .use_message_redirect(vmbus_cfg.vtl2_redirect)
-                .max_version(vmbus_cfg.vmbus_max_version)
+                .max_version(
+                    vmbus_cfg
+                        .vmbus_max_version
+                        .map(vmbus_core::MaxVersionInfo::new),
+                )
                 .delay_max_version(matches!(cfg.load_mode, LoadMode::Uefi { .. }))
                 .enable_mnf(true)
                 .build()
@@ -1679,7 +1684,7 @@ impl InitializedVm {
             // Start the vmbus kernel proxy if it's in use.
             #[cfg(windows)]
             if let Some(proxy_handle) = vmbus_cfg.vmbusproxy_handle {
-                vmbus_handle = Some(
+                vmbus_proxy = Some(
                     vmbus
                         .start_kernel_proxy(&vmbus_driver, proxy_handle)
                         .await
@@ -1804,7 +1809,10 @@ impl InitializedVm {
                     "nic",
                     nic_config.mac_address.into(),
                     &nic_config.instance_id,
-                    vmbus_handle.as_ref().context("missing vmbusproxy handle")?,
+                    vmbus_proxy
+                        .as_ref()
+                        .context("missing vmbusproxy handle")?
+                        .handle(),
                 )
                 .context("failed to create a kernel vmnic")?;
 
@@ -1843,6 +1851,12 @@ impl InitializedVm {
                             .context("VTL2 vmbus not enabled")?,
                     };
 
+                    let vtl = match dev_cfg.vtl {
+                        DeviceVtl::Vtl0 => Vtl::Vtl0,
+                        DeviceVtl::Vtl1 => Vtl::Vtl1,
+                        DeviceVtl::Vtl2 => Vtl::Vtl2,
+                    };
+
                     vmm_core::device_builder::build_vpci_device(
                         &driver_source,
                         &resolver,
@@ -1851,6 +1865,8 @@ impl InitializedVm {
                         dev_cfg.instance_id,
                         dev_cfg.resource,
                         &mut chipset_builder,
+                        partition.clone().into_doorbell_registration(vtl),
+                        Some(&mapper),
                         |device_id| {
                             let hv_device = partition.new_virtual_device(
                                 match dev_cfg.vtl {
@@ -1978,15 +1994,6 @@ impl InitializedVm {
                     },
                 )
                 .await?;
-            let bus = if bus == VirtioBus::Auto {
-                if partition.supports_virtual_devices() {
-                    VirtioBus::Vpci
-                } else {
-                    VirtioBus::Mmio
-                }
-            } else {
-                bus
-            };
             match bus {
                 VirtioBus::Mmio => {
                     let mmio_start = virtio_mmio_start - 0x1000;
@@ -1994,7 +2001,7 @@ impl InitializedVm {
                     let id = format!("{id}-{mmio_start}");
                     chipset_builder.arc_mutex_device(id).add(|services| {
                         VirtioMmioDevice::new(
-                            device,
+                            device.0,
                             services.new_line(IRQ_LINE_SET, "interrupt", virtio_mmio_irq),
                             partition.clone().into_doorbell_registration(Vtl::Vtl0),
                             mmio_start,
@@ -2022,7 +2029,7 @@ impl InitializedVm {
                         .on_pci_bus(bus)
                         .try_add(|services| {
                             VirtioPciDevice::new(
-                                device,
+                                device.0,
                                 PciInterruptModel::IntX(
                                     PciInterruptPin::IntA,
                                     services.new_line(IRQ_LINE_SET, "interrupt", pci_inta_line),
@@ -2033,19 +2040,6 @@ impl InitializedVm {
                             )
                         })?;
                 }
-                VirtioBus::Vpci => {
-                    add_virtio_vpci(
-                        &driver_source,
-                        &partition,
-                        &vmbus_server,
-                        &mapper,
-                        &id,
-                        &mut chipset_builder,
-                        device,
-                    )
-                    .await?;
-                }
-                VirtioBus::Auto => unreachable!(),
             }
         }
 
@@ -2219,7 +2213,7 @@ impl InitializedVm {
                 vtl2_framebuffer_gpa_base,
                 virtio_serial: virtio_serial_dup,
                 #[cfg(windows)]
-                _vmbus_handle: vmbus_handle,
+                _vmbus_proxy: vmbus_proxy,
                 #[cfg(windows)]
                 _kernel_vmnics: kernel_vmnics,
                 vmbus_devices,
@@ -2482,7 +2476,7 @@ impl LoadedVm {
     pub async fn run(
         mut self,
         driver: &impl Spawn,
-        mut rpc: mesh::Receiver<VmRpc>,
+        mut rpc_recv: mesh::Receiver<VmRpc>,
         mut worker_rpc: mesh::Receiver<WorkerRpc<RestartState>>,
     ) {
         enum Event {
@@ -2513,7 +2507,7 @@ impl LoadedVm {
 
         loop {
             let event: Event = {
-                let a = rpc.recv().map(Event::VmRpc);
+                let a = rpc_recv.recv().map(Event::VmRpc);
                 let b = worker_rpc.recv().map(Event::WorkerRpc);
                 (a, b).race().await
             };
@@ -2522,7 +2516,7 @@ impl LoadedVm {
                 Event::WorkerRpc(Err(_)) => break,
                 Event::WorkerRpc(Ok(message)) => match message {
                     WorkerRpc::Stop => break,
-                    WorkerRpc::Restart(response) => {
+                    WorkerRpc::Restart(rpc) => {
                         let mut stopped = false;
                         // First run the non-destructive operations.
                         let r = async {
@@ -2537,8 +2531,8 @@ impl LoadedVm {
                         .await;
                         match r {
                             Ok((shared_memory, saved_state)) => {
-                                response.send(Ok(self
-                                    .serialize(rpc, shared_memory, saved_state)
+                                rpc.complete(Ok(self
+                                    .serialize(rpc_recv, shared_memory, saved_state)
                                     .await));
 
                                 return;
@@ -2547,7 +2541,7 @@ impl LoadedVm {
                                 if stopped {
                                     self.state_units.start().await;
                                 }
-                                response.send(Err(RemoteError::new(err)));
+                                rpc.complete(Err(RemoteError::new(err)));
                             }
                         }
                     }
@@ -2623,16 +2617,17 @@ impl LoadedVm {
                         })
                         .await
                     }
-                    VmRpc::ConnectHvsock(Rpc((mut ctx, service_id, vtl), response)) => {
+                    VmRpc::ConnectHvsock(rpc) => {
+                        let ((mut ctx, service_id, vtl), response) = rpc.split();
                         if let Some(relay) = self.hvsock_relay(vtl) {
                             let fut = relay.connect(&mut ctx, service_id);
                             driver
                                 .spawn("vmrpc-hvsock-connect", async move {
-                                    response.send(fut.await.map_err(RemoteError::new))
+                                    response.complete(fut.await.map_err(RemoteError::new))
                                 })
                                 .detach();
                         } else {
-                            response.send(Err(RemoteError::new(anyhow::anyhow!(
+                            response.complete(Err(RemoteError::new(anyhow::anyhow!(
                                 "hvsock is not available"
                             ))));
                         }

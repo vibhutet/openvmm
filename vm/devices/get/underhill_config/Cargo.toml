@@ -3,7 +3,7 @@
 
 [package]
 name = "underhill_config"
-edition = "2021"
+edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
@@ -16,7 +16,6 @@ prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 thiserror.workspace = true
-
 
 [lints]
 workspace = true

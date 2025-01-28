@@ -192,7 +192,7 @@ fn install_task_name_panic_hook() {
 }
 
 async fn do_main(driver: DefaultDriver, mut tracing: TracingBackend) -> anyhow::Result<()> {
-    let opt = Options::parse(Vec::new())?;
+    let opt = Options::parse(Vec::new(), Vec::new())?;
 
     let crate_name = build_info::get().crate_name();
     let crate_revision = build_info::get().scm_revision();
@@ -322,6 +322,7 @@ async fn launch_workers(
         no_sidecar_hotplug: opt.no_sidecar_hotplug,
         gdbstub: opt.gdbstub,
         hide_isolation: opt.hide_isolation,
+        nvme_keep_alive: opt.nvme_keep_alive,
     };
 
     let (mut remote_console_cfg, framebuffer_access) =
@@ -469,7 +470,7 @@ async fn run_control(
         Control(ControlRequest),
     }
 
-    let mut restart_response = None;
+    let mut restart_rpc = None;
     loop {
         let event = {
             let mut stream = (
@@ -495,14 +496,7 @@ async fn run_control(
                             if workers.is_some() {
                                 Err(anyhow::anyhow!("workers have already been started"))?;
                             }
-                            for (key, value) in params.env {
-                                if let Some(value) = value {
-                                    std::env::set_var(key, value);
-                                } else {
-                                    std::env::remove_var(key);
-                                }
-                            }
-                            let new_opt = Options::parse(params.args)
+                            let new_opt = Options::parse(params.args, params.env)
                                 .context("failed to parse new options")?;
 
                             workers = Some(
@@ -557,7 +551,7 @@ async fn run_control(
                         };
 
                         let r = async {
-                            if restart_response.is_some() {
+                            if restart_rpc.is_some() {
                                 anyhow::bail!("previous restart still in progress");
                             }
 
@@ -574,7 +568,7 @@ async fn run_control(
                             rpc.complete(r.map_err(RemoteError::new));
                         } else {
                             state = ControlState::Restarting;
-                            restart_response = Some(rpc.1);
+                            restart_rpc = Some(rpc);
                         }
                     }
                     diag_server::DiagRequest::Pause(rpc) => {
@@ -653,7 +647,7 @@ async fn run_control(
                     }
                     #[cfg(feature = "profiler")]
                     diag_server::DiagRequest::Profile(rpc) => {
-                        let Rpc(rpc_params, rpc_sender) = rpc;
+                        let (rpc_params, rpc_sender) = rpc.split();
                         // Create profiler host if there is none created before
                         if profiler_host.is_none() {
                             match launch_mesh_host(mesh, "profiler", Some(tracing.tracer()))
@@ -664,7 +658,7 @@ async fn run_control(
                                     profiler_host = Some(host);
                                 }
                                 Err(e) => {
-                                    rpc_sender.send(Err(RemoteError::new(e)));
+                                    rpc_sender.complete(Err(RemoteError::new(e)));
                                     continue;
                                 }
                             }
@@ -686,7 +680,7 @@ async fn run_control(
                                 profiler_worker = worker;
                             }
                             Err(e) => {
-                                rpc_sender.send(Err(RemoteError::new(e)));
+                                rpc_sender.complete(Err(RemoteError::new(e)));
                                 continue;
                             }
                         }
@@ -701,7 +695,7 @@ async fn run_control(
                                     .and_then(|result| result.context("profiler worker failed"))
                                     .map_err(RemoteError::new);
 
-                                rpc_sender.send(result);
+                                rpc_sender.complete(result);
                             })
                             .detach();
                     }
@@ -709,9 +703,9 @@ async fn run_control(
             }
             Event::Worker(event) => match event {
                 WorkerEvent::Started => {
-                    if let Some(response) = restart_response.take() {
+                    if let Some(response) = restart_rpc.take() {
                         tracing::info!("restart complete");
-                        response.send(Ok(()));
+                        response.complete(Ok(()));
                     } else {
                         tracing::info!("vm worker started");
                     }
@@ -725,7 +719,7 @@ async fn run_control(
                 }
                 WorkerEvent::RestartFailed(err) => {
                     tracing::error!(error = &err as &dyn std::error::Error, "restart failed");
-                    restart_response.take().unwrap().send(Err(err));
+                    restart_rpc.take().unwrap().complete(Err(err));
                     state = ControlState::Started;
                 }
             },
