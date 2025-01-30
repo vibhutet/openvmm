@@ -3,6 +3,9 @@
 
 //! CPUID definitions and implementation specific to Underhill in TDX CVMs.
 
+// UNSAFETY: Needed to save extended state.
+#![expect(unsafe_code)]
+
 use super::COMMON_REQUIRED_LEAVES;
 use super::CpuidArchInitializer;
 use super::CpuidResultMask;
@@ -31,6 +34,8 @@ pub const TDX_REQUIRED_LEAVES: &[(CpuidFunction, Option<u32>)] = &[
     (CpuidFunction::CacheParameters, Some(3)),
 ];
 
+static mut MAX_XFD: u32 = 0;
+
 /// Implements [`CpuidArchSupport`] for TDX-isolation support
 pub struct TdxCpuidInitializer {}
 
@@ -50,7 +55,6 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
     }
 
     fn extended_max_function(&self) -> u32 {
-        // TODO TDX: Check if this is the same value in the OS repo
         CpuidFunction::ExtendedIntelMaximum.0
     }
 
@@ -110,7 +114,6 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
             }
             CpuidFunction::TmulInformation => {
                 if subleaf == 0 {
-                    // TODO TDX: does this actually have subleaves? the spec says 1+ are reserved
                     Some(CpuidResultMask::new(
                         0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, true,
                     ))
@@ -163,7 +166,6 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
     ) -> Result<(), CpuidResultsError> {
-        // TODO TDX: See HvlpPopulateExtendedStateCpuid
         let xfd_supported = if let Some(support) = results.get(&1).map(
             |CpuidResult {
                  eax,
@@ -181,17 +183,22 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         };
 
         let summary_mask = extended_state_mask & !xsave::X86X_XSAVE_LEGACY_FEATURES;
-
+        let mut max_xfd: u32 = 0;
         for i in 0..=super::MAX_EXTENDED_STATE_ENUMERATION_SUBLEAF {
             if (1 << i) & summary_mask != 0 {
                 let result = Self::cpuid(CpuidFunction::ExtendedStateEnumeration.0, i);
                 let result_xfd = cpuid::ExtendedStateEnumerationSubleafNEcx::from(result.ecx).xfd();
                 if xfd_supported && result_xfd {
-                    // TODO TDX: update some maximum xfd value; see HvlpMaximumXfd
+                    max_xfd |= 1 << i;
                 }
 
                 results.insert(i, result);
             }
+        }
+
+        // SAFETY: no concurrent accessors.
+        unsafe {
+            MAX_XFD = max_xfd;
         }
 
         Ok(())
@@ -214,7 +221,27 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
             }
         }
 
-        // TODO TDX: validation of leaf 0xB
+        // Validation for Leaf 0xB subleaf 0
+        let result = cpuid::ExtendedTopologyEcx::from(
+            Self::cpuid(CpuidFunction::ExtendedTopologyEnumeration.0, 0).ecx,
+        );
+
+        if (result.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_SMT)
+            || (result.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_SMT)
+        {
+            tracing::trace!("Topology not found!");
+        }
+
+        // Validation for Leaf 0xB subleaf 1
+        let result = cpuid::ExtendedTopologyEcx::from(
+            Self::cpuid(CpuidFunction::ExtendedTopologyEnumeration.0, 1).ecx,
+        );
+
+        if (result.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_CORE)
+            || (result.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_CORE)
+        {
+            tracing::trace!("Topology not found!");
+        }
 
         Ok(super::ExtendedTopologyResult {
             subleaf0: None,
