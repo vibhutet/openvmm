@@ -34,8 +34,6 @@ pub const TDX_REQUIRED_LEAVES: &[(CpuidFunction, Option<u32>)] = &[
     (CpuidFunction::CacheParameters, Some(3)),
 ];
 
-static mut MAX_XFD: u32 = 0;
-
 /// Implements [`CpuidArchSupport`] for TDX-isolation support
 pub struct TdxCpuidInitializer {}
 
@@ -165,7 +163,7 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-    ) -> Result<(), CpuidResultsError> {
+    ) -> Result<Option<u32>, CpuidResultsError> {
         let xfd_supported = if let Some(support) = results.get(&1).map(
             |CpuidResult {
                  eax,
@@ -196,12 +194,7 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
             }
         }
 
-        // SAFETY: no concurrent accessors.
-        unsafe {
-            MAX_XFD = max_xfd;
-        }
-
-        Ok(())
+        Ok(Some(max_xfd))
     }
 
     fn extended_topology(

@@ -64,7 +64,7 @@ trait CpuidArchInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-    ) -> Result<(), CpuidResultsError>;
+    ) -> Result<Option<u32>, CpuidResultsError>;
 
     /// Computes the Extended Topology results from other leaves if necessary.
     ///
@@ -172,6 +172,7 @@ pub struct ParsedCpuidEntry {
 struct CpuidResults {
     results: HashMap<CpuidFunction, CpuidEntry>,
     max_extended_state: u64,
+    max_xfd: u32,
 }
 
 // NOTE: Because subtables are used to calculate certain values _in order_ such
@@ -294,6 +295,7 @@ impl CpuidResults {
         let mut cached_results = Self {
             results,
             max_extended_state: 0, // will get updated as part of update_extended_state
+            max_xfd: 0,
         };
 
         // Validate results before updating leaves because the updates might
@@ -452,8 +454,10 @@ impl CpuidResults {
 
         let max_extended_state = max_xfem | max_xss;
 
-        arch_initializer
+        let max_xfd = arch_initializer
             .process_extended_state_subleaves(extended_state_subtable, max_extended_state)?;
+
+        self.max_xfd = max_xfd.expect("Invalid extended state value received");
 
         let xsave_size = self.xsave_size(max_xfem);
 
