@@ -163,7 +163,8 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-    ) -> Result<Option<u32>, CpuidResultsError> {
+        max_xfd: &mut u32,
+    ) -> Result<(), CpuidResultsError> {
         let xfd_supported = if let Some(support) = results.get(&1).map(
             |CpuidResult {
                  eax,
@@ -181,20 +182,23 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         };
 
         let summary_mask = extended_state_mask & !xsave::X86X_XSAVE_LEGACY_FEATURES;
-        let mut max_xfd: u32 = 0;
+
+        let mut max_xfd_value: u32 = 0;
         for i in 0..=super::MAX_EXTENDED_STATE_ENUMERATION_SUBLEAF {
             if (1 << i) & summary_mask != 0 {
                 let result = Self::cpuid(CpuidFunction::ExtendedStateEnumeration.0, i);
                 let result_xfd = cpuid::ExtendedStateEnumerationSubleafNEcx::from(result.ecx).xfd();
                 if xfd_supported && result_xfd {
-                    max_xfd |= 1 << i;
+                    max_xfd_value |= 1 << i;
                 }
 
                 results.insert(i, result);
             }
         }
 
-        Ok(Some(max_xfd))
+        *max_xfd = max_xfd_value;
+
+        Ok(())
     }
 
     fn extended_topology(
@@ -215,25 +219,25 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         }
 
         // Validation for Leaf 0xB subleaf 0
-        let result = cpuid::ExtendedTopologyEcx::from(
+        let extended_topology_ecx_0 = cpuid::ExtendedTopologyEcx::from(
             Self::cpuid(CpuidFunction::ExtendedTopologyEnumeration.0, 0).ecx,
         );
 
-        if (result.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_SMT)
-            || (result.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_SMT)
+        if (extended_topology_ecx_0.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_SMT)
+            || (extended_topology_ecx_0.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_SMT)
         {
-            tracing::trace!("Topology not found!");
+            tracing::error!("Incorrect values received: {:?}", extended_topology_ecx_0);
         }
 
         // Validation for Leaf 0xB subleaf 1
-        let result = cpuid::ExtendedTopologyEcx::from(
+        let extended_topology_ecx_1 = cpuid::ExtendedTopologyEcx::from(
             Self::cpuid(CpuidFunction::ExtendedTopologyEnumeration.0, 1).ecx,
         );
 
-        if (result.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_CORE)
-            || (result.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_CORE)
+        if (extended_topology_ecx_1.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_CORE)
+            || (extended_topology_ecx_1.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_CORE)
         {
-            tracing::trace!("Topology not found!");
+            tracing::error!("Incorrect values received: {:?}", extended_topology_ecx_1);
         }
 
         Ok(super::ExtendedTopologyResult {

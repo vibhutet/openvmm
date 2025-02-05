@@ -253,7 +253,8 @@ impl CpuidArchInitializer for SnpCpuidInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-    ) -> Result<Option<u32>, CpuidResultsError> {
+        _max_xfd: &mut u32,
+    ) -> Result<(), CpuidResultsError> {
         let summary_mask = extended_state_mask & !xsave::X86X_XSAVE_LEGACY_FEATURES;
 
         for i in 0..=super::MAX_EXTENDED_STATE_ENUMERATION_SUBLEAF {
@@ -265,7 +266,7 @@ impl CpuidArchInitializer for SnpCpuidInitializer {
             }
         }
 
-        Ok(Some(0))
+        Ok(())
     }
 
     fn extended_topology(
