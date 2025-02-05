@@ -226,7 +226,7 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         if (extended_topology_ecx_0.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_SMT)
             || (extended_topology_ecx_0.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_SMT)
         {
-            tracing::error!("Incorrect values received: {:?}", extended_topology_ecx_0);
+            tracing::error!("Incorrect values received: {:?}. Level Number should represent sub-leaf 0, while Level Type should represent domain type 1 for logical processor.", extended_topology_ecx_0);
         }
 
         // Validation for Leaf 0xB subleaf 1
@@ -237,7 +237,7 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         if (extended_topology_ecx_1.level_number() != super::CPUID_LEAF_B_LEVEL_NUMBER_CORE)
             || (extended_topology_ecx_1.level_type() != super::CPUID_LEAF_B_LEVEL_TYPE_CORE)
         {
-            tracing::error!("Incorrect values received: {:?}", extended_topology_ecx_1);
+            tracing::error!("Incorrect values received: {:?}. Level Number should represent sub-leaf 1, while Level Type should represent domain type 2 for Core.", extended_topology_ecx_1);
         }
 
         Ok(super::ExtendedTopologyResult {
