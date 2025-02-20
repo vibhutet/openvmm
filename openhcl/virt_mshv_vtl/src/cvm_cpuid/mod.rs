@@ -62,7 +62,6 @@ trait CpuidArchInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-        max_xfd: &mut u32,
     ) -> Result<(), CpuidResultsError>;
 
     /// Computes the Extended Topology results from other leaves if necessary.
@@ -181,7 +180,6 @@ pub struct CpuidResults {
     max_extended_state: u64,
     arch_support: Box<dyn CpuidArchSupport>,
     vps_per_socket: u32,
-    max_xfd: u32,
 }
 
 type CpuidSubtable = HashMap<u32, CpuidResult>;
@@ -314,7 +312,6 @@ impl CpuidResults {
             max_extended_state: 0, // will get updated as part of update_extended_state
             arch_support,
             vps_per_socket: 0, // will get updated as part of update_extended_topology
-            max_xfd: 0,        // will get updated as part of process_extended_state_subleaves
         };
 
         // Validate results before updating leaves because the updates might
@@ -525,11 +522,8 @@ impl CpuidResults {
 
         let max_extended_state = max_xfem | max_xss;
 
-        arch_initializer.process_extended_state_subleaves(
-            extended_state_subtable,
-            max_extended_state,
-            &mut self.max_xfd,
-        )?;
+        arch_initializer
+            .process_extended_state_subleaves(extended_state_subtable, max_extended_state)?;
 
         let xsave_size = self.xsave_size(max_xfem);
 
