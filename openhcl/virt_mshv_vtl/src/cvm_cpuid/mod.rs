@@ -61,7 +61,6 @@ trait CpuidArchInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-        max_xfd: &mut u32,
     ) -> Result<(), CpuidResultsError>;
 
     /// Computes the Extended Topology results from other leaves if necessary.
@@ -452,11 +451,8 @@ impl CpuidResults {
 
         let max_extended_state = max_xfem | max_xss;
 
-        arch_initializer.process_extended_state_subleaves(
-            extended_state_subtable,
-            max_extended_state,
-            &mut self.max_xfd,
-        )?;
+        arch_initializer
+            .process_extended_state_subleaves(extended_state_subtable, max_extended_state)?;
 
         let xsave_size = self.xsave_size(max_xfem);
 

@@ -253,7 +253,6 @@ impl CpuidArchInitializer for SnpCpuidInitializer {
         &self,
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
-        _max_xfd: &mut u32,
     ) -> Result<(), CpuidResultsError> {
         let summary_mask = extended_state_mask & !xsave::X86X_XSAVE_LEGACY_FEATURES;
 
