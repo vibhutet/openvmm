@@ -240,7 +240,7 @@ mod json {
             })
         }
 
-        #[allow(clippy::many_single_char_names)]
+        #[expect(clippy::many_single_char_names)]
         pub fn base64_u32<'de, D: Deserializer<'de>>(d: D) -> Result<u32, D::Error> {
             let s: &str = Deserialize::deserialize(d)?;
 
@@ -275,7 +275,7 @@ mod json {
                     v.len()
                 )));
             }
-            Ok(Guid::read_from_prefix(v.as_slice()).unwrap())
+            Ok(Guid::read_from_prefix(v.as_slice()).unwrap().0) // TODO: zerocopy: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
         }
     }
 }

@@ -9,8 +9,6 @@ use crate::driver::save_restore::PendingCommandSavedState;
 use crate::driver::save_restore::PendingCommandsSavedState;
 use crate::driver::save_restore::QueueHandlerSavedState;
 use crate::driver::save_restore::QueuePairSavedState;
-use crate::page_allocator::PageAllocator;
-use crate::page_allocator::ScopedPages;
 use crate::queues::CompletionQueue;
 use crate::queues::SubmissionQueue;
 use crate::registers::DeviceRegisters;
@@ -39,9 +37,10 @@ use user_driver::interrupt::DeviceInterrupt;
 use user_driver::memory::MemoryBlock;
 use user_driver::memory::PAGE_SIZE;
 use user_driver::memory::PAGE_SIZE64;
+use user_driver::page_allocator::PageAllocator;
+use user_driver::page_allocator::ScopedPages;
 use user_driver::DeviceBacking;
-use user_driver::HostDmaAllocator;
-use zerocopy::FromZeroes;
+use zerocopy::FromZeros;
 
 /// Value for unused PRP entries, to catch/mitigate buffer size mismatches.
 const INVALID_PAGE_ADDR: u64 = !(PAGE_SIZE as u64 - 1);
@@ -184,8 +183,8 @@ impl QueuePair {
     ) -> anyhow::Result<Self> {
         let total_size =
             QueuePair::SQ_SIZE + QueuePair::CQ_SIZE + QueuePair::PER_QUEUE_PAGES * PAGE_SIZE;
-        let mem = device
-            .host_allocator()
+        let dma_client = device.dma_client();
+        let mem = dma_client
             .allocate_dma_buffer(total_size)
             .context("failed to allocate memory for queues")?;
 
@@ -241,7 +240,6 @@ impl QueuePair {
         });
 
         // Page allocator uses remaining part of the buffer for dynamic allocation.
-        #[allow(clippy::assertions_on_constants)]
         const _: () = assert!(
             QueuePair::PER_QUEUE_PAGES * PAGE_SIZE >= 128 * 1024 + PAGE_SIZE,
             "not enough room for an ATAPI IO plus a PRP list"
@@ -518,7 +516,15 @@ impl Issuer {
             .expect("pool cap is >= 1 page");
 
         mem.write(data);
-        let prp = mem.prp();
+        assert_eq!(
+            mem.page_count(),
+            1,
+            "larger requests not currently supported"
+        );
+        let prp = Prp {
+            dptr: [mem.physical_address(0), INVALID_PAGE_ADDR],
+            _pages: None,
+        };
         command.dptr = prp.dptr;
         self.issue_raw(command).await
     }
@@ -534,25 +540,19 @@ impl Issuer {
             .await
             .expect("pool cap is sufficient");
 
-        let prp = mem.prp();
+        assert_eq!(
+            mem.page_count(),
+            1,
+            "larger requests not currently supported"
+        );
+        let prp = Prp {
+            dptr: [mem.physical_address(0), INVALID_PAGE_ADDR],
+            _pages: None,
+        };
         command.dptr = prp.dptr;
         let completion = self.issue_raw(command).await;
         mem.read(data);
         completion
-    }
-}
-
-impl ScopedPages<'_> {
-    fn prp(&self) -> Prp<'_> {
-        assert_eq!(
-            self.page_count(),
-            1,
-            "larger requests not currently supported"
-        );
-        Prp {
-            dptr: [self.physical_address(0), INVALID_PAGE_ADDR],
-            _pages: None,
-        }
     }
 }
 
@@ -720,6 +720,6 @@ impl QueueHandler {
 pub(crate) fn admin_cmd(opcode: spec::AdminOpcode) -> spec::Command {
     spec::Command {
         cdw0: spec::Cdw0::new().with_opcode(opcode.0),
-        ..FromZeroes::new_zeroed()
+        ..FromZeros::new_zeroed()
     }
 }

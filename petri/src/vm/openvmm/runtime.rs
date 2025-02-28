@@ -6,6 +6,7 @@
 use super::PetriVmResourcesOpenVmm;
 use crate::openhcl_diag::OpenHclDiagHandler;
 use crate::worker::Worker;
+use crate::OpenHclServicingFlags;
 use crate::PetriVm;
 use crate::ShutdownKind;
 use anyhow::Context;
@@ -25,7 +26,7 @@ use pal_async::task::Task;
 use pal_async::timer::PolledTimer;
 use pal_async::DefaultDriver;
 use petri_artifacts_common::tags::GuestQuirks;
-use petri_artifacts_core::ArtifactHandle;
+use petri_artifacts_core::ResolvedArtifact;
 use pipette_client::PipetteClient;
 use std::future::Future;
 use std::path::Path;
@@ -103,12 +104,11 @@ impl PetriVmOpenVmm {
 
     /// Get the path to the VTL 2 vsock socket, if the VM is configured with OpenHCL.
     pub fn vtl2_vsock_path(&self) -> anyhow::Result<&Path> {
-        self.inner.openhcl_diag().map(|x| &*x.vtl2_vsock_path)
-    }
-
-    /// Get the artifact resolver constructed for this VM.
-    pub fn artifact_resolver(&self) -> &petri_artifacts_core::TestArtifacts {
-        &self.inner.resources.resolver
+        self.inner
+            .resources
+            .vtl2_vsock_path
+            .as_deref()
+            .context("VM is not configured with OpenHCL")
     }
 
     /// Wait for the VM to halt, returning the reason for the halt.
@@ -141,7 +141,7 @@ impl PetriVmOpenVmm {
         self.inner.mesh.shutdown().await;
 
         tracing::info!("Mesh shutdown, waiting for logging tasks");
-        for t in self.inner.resources.serial_tasks {
+        for t in self.inner.resources.log_stream_tasks {
             t.await?;
         }
 
@@ -167,12 +167,21 @@ impl PetriVmOpenVmm {
         pub async fn wait_for_successful_boot_event(&mut self) -> anyhow::Result<()>
     );
     petri_vm_fn!(
+        /// Waits for the Hyper-V shutdown IC to be ready, returning a receiver
+        /// that will be closed when it is no longer ready.
+        pub async fn wait_for_enlightened_shutdown_ready(&mut self) -> anyhow::Result<mesh::OneshotReceiver<()>>
+    );
+    petri_vm_fn!(
         /// Instruct the guest to shutdown via the Hyper-V shutdown IC.
         pub async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()>
     );
     petri_vm_fn!(
         /// Restarts OpenHCL.
-        pub async fn restart_openhcl(&mut self, new_openhcl: ArtifactHandle<impl petri_artifacts_common::tags::IsOpenhclIgvm>) -> anyhow::Result<()>
+        pub async fn restart_openhcl(
+            &mut self,
+            new_openhcl: ResolvedArtifact<impl petri_artifacts_common::tags::IsOpenhclIgvm>,
+            flags: OpenHclServicingFlags
+        ) -> anyhow::Result<()>
     );
     petri_vm_fn!(
         /// Resets the hardware state of the VM, simulating a power cycle.
@@ -301,13 +310,21 @@ impl PetriVmInner {
         Ok(())
     }
 
-    async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()> {
+    async fn wait_for_enlightened_shutdown_ready(
+        &mut self,
+    ) -> anyhow::Result<mesh::OneshotReceiver<()>> {
         tracing::info!("Waiting for shutdown ic ready");
-        self.resources
+        let recv = self
+            .resources
             .shutdown_ic_send
             .call(ShutdownRpc::WaitReady, ())
             .await?;
 
+        Ok(recv)
+    }
+
+    async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()> {
+        self.wait_for_enlightened_shutdown_ready().await?;
         if let Some(duration) = self.quirks.hyperv_shutdown_ic_sleep {
             tracing::info!("QUIRK: Waiting for {:?}", duration);
             PolledTimer::new(&self.resources.driver)
@@ -344,7 +361,8 @@ impl PetriVmInner {
 
     async fn restart_openhcl(
         &self,
-        new_openhcl: ArtifactHandle<impl petri_artifacts_common::tags::IsOpenhclIgvm>,
+        new_openhcl: ResolvedArtifact<impl petri_artifacts_common::tags::IsOpenhclIgvm>,
+        flags: OpenHclServicingFlags,
     ) -> anyhow::Result<()> {
         let ged_send = self
             .resources
@@ -352,10 +370,9 @@ impl PetriVmInner {
             .as_ref()
             .context("openhcl not configured")?;
 
-        let igvm_path = self.resources.resolver.resolve(new_openhcl);
-        let igvm_file = fs_err::File::open(igvm_path).context("failed to open igvm file")?;
+        let igvm_file = fs_err::File::open(new_openhcl).context("failed to open igvm file")?;
         self.worker
-            .restart_openhcl(ged_send, igvm_file.into())
+            .restart_openhcl(ged_send, flags, igvm_file.into())
             .await
     }
 

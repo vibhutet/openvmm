@@ -8,10 +8,9 @@
 
 use crate::interrupt::DeviceInterrupt;
 use crate::interrupt::DeviceInterruptSource;
-use crate::memory::MemoryBlock;
 use crate::DeviceBacking;
 use crate::DeviceRegisterIo;
-use crate::HostDmaAllocator;
+use crate::DmaClient;
 use anyhow::Context;
 use futures::FutureExt;
 use futures_concurrency::future::Race;
@@ -29,20 +28,15 @@ use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
 use std::time::Duration;
 use uevent::UeventListener;
+use vfio_bindings::bindings::vfio::VFIO_PCI_CONFIG_REGION_INDEX;
 use vfio_sys::IommuType;
 use vfio_sys::IrqInfo;
 use vmcore::vm_task::VmTaskDriver;
 use vmcore::vm_task::VmTaskDriverSource;
-use zerocopy::AsBytes;
 use zerocopy::FromBytes;
-
-pub trait VfioDmaBuffer: 'static + Send + Sync {
-    /// Create a new DMA buffer of the given `len` bytes. Guaranteed to be zero-initialized.
-    fn create_dma_buffer(&self, len: usize) -> anyhow::Result<MemoryBlock>;
-
-    /// Restore a dma buffer in the predefined location with the given `len` in bytes.
-    fn restore_dma_buffer(&self, len: usize, base_pfn: u64) -> anyhow::Result<MemoryBlock>;
-}
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 /// A device backend accessed via VFIO.
 #[derive(Inspect)]
@@ -55,13 +49,14 @@ pub struct VfioDevice {
     #[inspect(skip)]
     device: Arc<vfio_sys::Device>,
     #[inspect(skip)]
-    dma_buffer: Arc<dyn VfioDmaBuffer>,
-    #[inspect(skip)]
     msix_info: IrqInfo,
     #[inspect(skip)]
     driver_source: VmTaskDriverSource,
     #[inspect(iter_by_index)]
     interrupts: Vec<Option<InterruptState>>,
+    #[inspect(skip)]
+    config_space: vfio_sys::RegionInfo,
+    dma_client: Arc<dyn DmaClient>,
 }
 
 #[derive(Inspect)]
@@ -78,9 +73,9 @@ impl VfioDevice {
     pub async fn new(
         driver_source: &VmTaskDriverSource,
         pci_id: &str,
-        dma_buffer: Arc<dyn VfioDmaBuffer>,
+        dma_client: Arc<dyn DmaClient>,
     ) -> anyhow::Result<Self> {
-        Self::restore(driver_source, pci_id, dma_buffer, false).await
+        Self::restore(driver_source, pci_id, false, dma_client).await
     }
 
     /// Creates a new VFIO-backed device for the PCI device with `pci_id`.
@@ -88,8 +83,8 @@ impl VfioDevice {
     pub async fn restore(
         driver_source: &VmTaskDriverSource,
         pci_id: &str,
-        dma_buffer: Arc<dyn VfioDmaBuffer>,
         keepalive: bool,
+        dma_client: Arc<dyn DmaClient>,
     ) -> anyhow::Result<Self> {
         let path = Path::new("/sys/bus/pci/devices").join(pci_id);
 
@@ -125,16 +120,68 @@ impl VfioDevice {
             anyhow::bail!("unsupported: kernel does not support dynamic msix allocation");
         }
 
-        Ok(Self {
+        let config_space = device.region_info(VFIO_PCI_CONFIG_REGION_INDEX)?;
+        let this = Self {
             pci_id: pci_id.into(),
             _container: container,
             _group: group,
             device: Arc::new(device),
-            dma_buffer,
             msix_info,
+            config_space,
             driver_source: driver_source.clone(),
             interrupts: Vec::new(),
-        })
+            dma_client,
+        };
+
+        // Ensure bus master enable and memory space enable are set, and that
+        // INTx is disabled.
+        this.enable_device().context("failed to enable device")?;
+        Ok(this)
+    }
+
+    fn enable_device(&self) -> anyhow::Result<()> {
+        let offset = pci_core::spec::cfg_space::HeaderType00::STATUS_COMMAND.0;
+        let status_command = self.read_config(offset)?;
+        let command = pci_core::spec::cfg_space::Command::from(status_command as u16);
+
+        let command = command
+            .with_bus_master(true)
+            .with_intx_disable(true)
+            .with_mmio_enabled(true);
+
+        let status_command = (status_command & 0xffff0000) | u16::from(command) as u32;
+        self.write_config(offset, status_command)?;
+        Ok(())
+    }
+
+    pub fn read_config(&self, offset: u16) -> anyhow::Result<u32> {
+        if offset as u64 > self.config_space.size - 4 {
+            anyhow::bail!("invalid config offset");
+        }
+
+        let mut buf = [0u8; 4];
+        self.device
+            .as_ref()
+            .as_ref()
+            .read_at(&mut buf, self.config_space.offset + offset as u64)
+            .context("failed to read config")?;
+
+        Ok(u32::from_ne_bytes(buf))
+    }
+
+    pub fn write_config(&self, offset: u16, data: u32) -> anyhow::Result<()> {
+        if offset as u64 > self.config_space.size - 4 {
+            anyhow::bail!("invalid config offset");
+        }
+
+        let buf = data.to_ne_bytes();
+        self.device
+            .as_ref()
+            .as_ref()
+            .write_at(&buf, self.config_space.offset + offset as u64)
+            .context("failed to write config")?;
+
+        Ok(())
     }
 
     /// Maps PCI BAR[n] to VA space.
@@ -175,7 +222,6 @@ pub struct MappedRegionWithFallback {
 
 impl DeviceBacking for VfioDevice {
     type Registers = MappedRegionWithFallback;
-    type DmaAllocator = LockedMemoryAllocator;
 
     fn id(&self) -> &str {
         &self.pci_id
@@ -185,10 +231,8 @@ impl DeviceBacking for VfioDevice {
         (*self).map_bar(n)
     }
 
-    fn host_allocator(&self) -> Self::DmaAllocator {
-        LockedMemoryAllocator {
-            dma_buffer: self.dma_buffer.clone(),
-        }
+    fn dma_client(&self) -> Arc<dyn DmaClient> {
+        self.dma_client.clone()
     }
 
     fn max_interrupt_count(&self) -> u32 {
@@ -366,7 +410,7 @@ impl MappedRegionWithFallback {
         unsafe { self.mapping.as_ptr().byte_add(offset).cast() }
     }
 
-    fn read_from_mapping<T: AsBytes + FromBytes>(
+    fn read_from_mapping<T: IntoBytes + FromBytes + Immutable + KnownLayout>(
         &self,
         offset: usize,
     ) -> Result<T, sparse_mmap::MemoryError> {
@@ -374,7 +418,7 @@ impl MappedRegionWithFallback {
         unsafe { sparse_mmap::try_read_volatile(self.mapping::<T>(offset)) }
     }
 
-    fn write_to_mapping<T: AsBytes + FromBytes>(
+    fn write_to_mapping<T: IntoBytes + FromBytes + Immutable + KnownLayout>(
         &self,
         offset: usize,
         data: T,
@@ -470,18 +514,4 @@ pub fn vfio_set_device_reset_method(
         .collect();
     fs_err::write(path, reset_method)?;
     Ok(())
-}
-
-pub struct LockedMemoryAllocator {
-    dma_buffer: Arc<dyn VfioDmaBuffer>,
-}
-
-impl HostDmaAllocator for LockedMemoryAllocator {
-    fn allocate_dma_buffer(&self, len: usize) -> anyhow::Result<MemoryBlock> {
-        self.dma_buffer.create_dma_buffer(len)
-    }
-
-    fn attach_dma_buffer(&self, len: usize, base_pfn: u64) -> anyhow::Result<MemoryBlock> {
-        self.dma_buffer.restore_dma_buffer(len, base_pfn)
-    }
 }

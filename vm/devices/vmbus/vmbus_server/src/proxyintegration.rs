@@ -42,8 +42,9 @@ use vmbus_proxy::vmbusioctl::VMBUS_SERVER_OPEN_CHANNEL_OUTPUT_PARAMETERS;
 use vmbus_proxy::ProxyAction;
 use vmbus_proxy::VmbusProxy;
 use vmcore::interrupt::Interrupt;
-use winapi::shared::winerror::ERROR_CANCELLED;
-use zerocopy::AsBytes;
+use windows::core::HRESULT;
+use windows::Win32::Foundation::ERROR_CANCELLED;
+use zerocopy::IntoBytes;
 
 pub struct ProxyIntegration {
     cancel: Cancel,
@@ -57,25 +58,29 @@ impl ProxyIntegration {
     }
 
     /// Returns the handle to the vmbus proxy driver.
-    pub fn handle(&self) -> &OwnedHandle {
-        &self.handle
+    pub fn handle(&self) -> BorrowedHandle<'_> {
+        self.handle.as_handle()
     }
 
-    pub(crate) async fn start(
+    /// Starts the vmbus proxy.
+    pub async fn start(
         driver: &(impl SpawnDriver + Clone),
         handle: ProxyHandle,
         server: Arc<VmbusServerControl>,
-        mem: &GuestMemory,
+        vtl2_server: Option<Arc<VmbusServerControl>>,
+        mem: Option<&GuestMemory>,
     ) -> io::Result<Self> {
         let mut proxy = VmbusProxy::new(driver, handle)?;
         let handle = proxy.handle().try_clone_to_owned()?;
-        proxy.set_memory(mem).await?;
+        if let Some(mem) = mem {
+            proxy.set_memory(mem).await?;
+        }
 
         let (cancel_ctx, cancel) = CancelContext::new().with_cancel();
         driver
             .spawn(
                 "vmbus_proxy",
-                proxy_thread(driver.clone(), proxy, server, cancel_ctx),
+                proxy_thread(driver.clone(), proxy, server, vtl2_server, cancel_ctx),
             )
             .detach();
 
@@ -94,15 +99,21 @@ struct ProxyTask {
     gpadls: Arc<Mutex<HashMap<u64, HashSet<GpadlId>>>>,
     proxy: Arc<VmbusProxy>,
     server: Arc<VmbusServerControl>,
+    vtl2_server: Option<Arc<VmbusServerControl>>,
 }
 
 impl ProxyTask {
-    fn new(control: Arc<VmbusServerControl>, proxy: Arc<VmbusProxy>) -> Self {
+    fn new(
+        server: Arc<VmbusServerControl>,
+        vtl2_server: Option<Arc<VmbusServerControl>>,
+        proxy: Arc<VmbusProxy>,
+    ) -> Self {
         Self {
             channels: Arc::new(Mutex::new(HashMap::new())),
             gpadls: Arc::new(Mutex::new(HashMap::new())),
             proxy,
-            server: control,
+            server,
+            vtl2_server,
         }
     }
 
@@ -209,12 +220,31 @@ impl ProxyTask {
         offer: vmbus_proxy::vmbusioctl::VMBUS_CHANNEL_OFFER,
         incoming_event: Event,
     ) -> Option<mesh::Receiver<ChannelRequest>> {
+        let server = match offer.TargetVtl {
+            0 => self.server.as_ref(),
+            2 => {
+                if let Some(server) = self.vtl2_server.as_ref() {
+                    server
+                } else {
+                    tracing::error!(?offer, "VTL2 offer without VTL2 server");
+                    return None;
+                }
+            }
+            _ => {
+                tracing::error!(?offer, "unsupported offer VTL");
+                return None;
+            }
+        };
+
         let channel_type = if offer.ChannelFlags & VMBUS_CHANNEL_ENUMERATE_DEVICE_INTERFACE != 0 {
             let pipe_mode = u32::from_ne_bytes(offer.UserDefined[..4].try_into().unwrap());
             let message_mode = match pipe_mode {
                 vmbus_proxy::vmbusioctl::VMBUS_PIPE_TYPE_BYTE => false,
                 vmbus_proxy::vmbusioctl::VMBUS_PIPE_TYPE_MESSAGE => true,
-                _ => panic!("BUGBUG: unsupported"),
+                _ => {
+                    tracing::error!(?offer, "unsupported offer pipe mode");
+                    return None;
+                }
             };
             ChannelType::Pipe { message_mode }
         } else {
@@ -240,7 +270,8 @@ impl ProxyTask {
         };
         let (request_send, request_recv) = mesh::channel();
         let (server_request_send, server_request_recv) = mesh::channel();
-        let recv = self.server.send.call_failable(
+
+        let recv = server.send.call_failable(
             OfferRequest::Offer,
             OfferInfo {
                 params: offer.into(),
@@ -372,7 +403,7 @@ impl ProxyTask {
                         tracing::warn!(proxy_id, "closed while some gpadls are still registered");
                         for gpadl_id in gpadls {
                             if let Err(e) = self.proxy.delete_gpadl(proxy_id, gpadl_id.0).await {
-                                if e.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+                                if e.code() == HRESULT::from(ERROR_CANCELLED) {
                                     // No further IOs will succeed if one was cancelled. This can
                                     // happen here if we're in the process of shutting down.
                                     tracing::debug!("gpadl delete cancelled");
@@ -425,11 +456,12 @@ async fn proxy_thread(
     spawner: impl Spawn,
     proxy: VmbusProxy,
     server: Arc<VmbusServerControl>,
+    vtl2_server: Option<Arc<VmbusServerControl>>,
     mut cancel: CancelContext,
 ) {
     let (send, recv) = mesh::channel();
     let proxy = Arc::new(proxy);
-    let task = Arc::new(ProxyTask::new(server, Arc::clone(&proxy)));
+    let task = Arc::new(ProxyTask::new(server, vtl2_server, Arc::clone(&proxy)));
     let offers = task.run_offers(send);
     let requests = task.run_channel_requests(spawner, recv);
     let cancellation = async {

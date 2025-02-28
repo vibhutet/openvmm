@@ -4,10 +4,11 @@
 //! Tests common to every executor.
 
 // Uses futures channels, but is only test code.
-#![allow(clippy::disallowed_methods)]
+#![expect(clippy::disallowed_methods)]
 
 use crate::driver::Driver;
 use crate::socket::PolledSocket;
+use crate::task::with_current_task_metadata;
 use crate::task::Spawn;
 use crate::timer::Instant;
 use futures::channel::oneshot;
@@ -44,6 +45,16 @@ where
     S: Spawn,
     F: 'static + FnOnce() + Send,
 {
+    // Validate that there is no current task after the thread is done.
+    let mut f = move || {
+        let (spawn, run) = f();
+        let run = move || {
+            run();
+            with_current_task_metadata(|metadata| assert!(metadata.is_none()));
+        };
+        (spawn, run)
+    };
+
     // no tasks
     {
         let (_, run) = f();

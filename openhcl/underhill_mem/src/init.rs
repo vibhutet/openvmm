@@ -4,8 +4,8 @@
 #![expect(missing_docs)]
 
 use crate::mapping::GuestMemoryMapping;
-use crate::mapping::HardwareIsolatedMemoryProtector;
-use crate::mapping::MemoryAcceptor;
+use crate::HardwareIsolatedMemoryProtector;
+use crate::MemoryAcceptor;
 use anyhow::Context;
 use futures::future::try_join_all;
 use guestmem::GuestMemory;
@@ -469,8 +469,7 @@ async fn apply_vtl2_protections(
                         tracing::debug!(
                             cpu = underhill_threadpool::Thread::current()
                                 .unwrap()
-                                .driver()
-                                .target_cpu(),
+                                .with_driver(|driver| driver.target_cpu()),
                             %range,
                             "applying protections"
                         );

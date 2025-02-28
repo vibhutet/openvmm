@@ -14,8 +14,6 @@ use super::super::vp_state::UhVpStateAccess;
 use super::super::BackingPrivate;
 use super::super::UhEmulationState;
 use super::super::UhRunVpError;
-use crate::processor::from_seg;
-use crate::processor::LapicState;
 use crate::processor::SidecarExitReason;
 use crate::processor::SidecarRemoveExit;
 use crate::processor::UhHypercallHandler;
@@ -26,15 +24,14 @@ use crate::Error;
 use crate::GuestVsmState;
 use crate::GuestVsmVtl1State;
 use crate::GuestVtl;
-use crate::UhPartitionInner;
-use crate::WakeReason;
 use hcl::ioctl;
 use hcl::ioctl::x64::MshvX64;
 use hcl::ioctl::ApplyVtlProtectionsError;
-use hcl::ioctl::ProcessorRunner;
 use hcl::protocol;
 use hv1_emulator::hv::ProcessorVtlHv;
 use hv1_emulator::synic::ProcessorSynic;
+use hv1_hypercall::HvRepResult;
+use hv1_structs::VtlSet;
 use hvdef::hypercall;
 use hvdef::HvDeliverabilityNotificationsRegister;
 use hvdef::HvError;
@@ -44,10 +41,7 @@ use hvdef::HvMessageType;
 use hvdef::HvRegisterValue;
 use hvdef::HvRegisterVsmPartitionConfig;
 use hvdef::HvX64InterceptMessageHeader;
-use hvdef::HvX64InterruptStateRegister;
 use hvdef::HvX64PendingEvent;
-use hvdef::HvX64PendingEventReg0;
-use hvdef::HvX64PendingInterruptionRegister;
 use hvdef::HvX64PendingInterruptionType;
 use hvdef::HvX64RegisterName;
 use hvdef::Vtl;
@@ -61,43 +55,32 @@ use virt::state::HvRegisterState;
 use virt::state::StateElement;
 use virt::vp;
 use virt::vp::AccessVpState;
-use virt::vp::MpState;
 use virt::x86::MsrError;
-use virt::x86::MsrErrorExt;
-use virt::Processor;
 use virt::StopVp;
 use virt::VpHaltReason;
 use virt::VpIndex;
-use virt_support_apic::ApicClient;
-use virt_support_apic::ApicWork;
 use virt_support_x86emu::emulate::EmuCheckVtlAccessError;
 use virt_support_x86emu::emulate::EmuTranslateError;
 use virt_support_x86emu::emulate::EmuTranslateResult;
 use virt_support_x86emu::emulate::EmulatorSupport;
-use vmcore::vmtime::VmTime;
-use vmcore::vmtime::VmTimeAccess;
-use vtl_array::VtlArray;
-use vtl_array::VtlSet;
 use x86defs::xsave::Fxsave;
 use x86defs::xsave::XsaveHeader;
 use x86defs::xsave::XFEATURE_SSE;
 use x86defs::xsave::XFEATURE_X87;
 use x86defs::RFlags;
 use x86defs::SegmentRegister;
-use zerocopy::AsBytes;
 use zerocopy::FromBytes;
-use zerocopy::FromZeroes;
+use zerocopy::FromZeros;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
+use zerocopy::KnownLayout;
 
 /// A backing for hypervisor-backed partitions (non-isolated and
 /// software-isolated).
 #[derive(InspectMut)]
 pub struct HypervisorBackedX86 {
-    pub(super) lapics: Option<VtlArray<LapicState, 2>>,
-    hv: Option<VtlArray<ProcessorVtlHv, 2>>,
-    // TODO WHP GUEST VSM: To be completely correct here, when emulating the APICs
-    // we would need two sets of deliverability notifications too. However currently
-    // we don't support VTL 1 on WHP, and on the hypervisor we don't emulate the APIC,
-    // so this can wait.
+    // VTL0 only, used for synic message and extint readiness notifications.
+    // We do not currently support synic message ports or extint interrupts for VTL1.
     #[inspect(with = "|x| inspect::AsHex(u64::from(*x))")]
     deliverability_notifications: HvDeliverabilityNotificationsRegister,
     /// Next set of deliverability notifications. See register definition for details.
@@ -136,7 +119,7 @@ pub struct MshvEmulationCache {
 }
 
 impl BackingPrivate for HypervisorBackedX86 {
-    type HclBacking = MshvX64;
+    type HclBacking<'mshv> = MshvX64<'mshv>;
     type Shared = ();
     type EmulationCache = MshvEmulationCache;
 
@@ -161,28 +144,7 @@ impl BackingPrivate for HypervisorBackedX86 {
             reserved: [0; 384],
         };
 
-        // This VP may have been running on the sidecar, so we need to check if the apic
-        // base has moved from the reset value.
-        let lapics = if let Some(mut lapics) = params.lapics {
-            let apic_base = params
-                .runner
-                // TODO GUEST VSM
-                .get_vp_register(GuestVtl::Vtl0, HvX64RegisterName::ApicBase)
-                .unwrap()
-                .as_u64();
-
-            lapics.each_mut().map(|state| {
-                state.lapic.set_apic_base(apic_base).unwrap();
-            });
-
-            lapics.into()
-        } else {
-            None
-        };
-
         Ok(Self {
-            lapics,
-            hv: params.hv,
             deliverability_notifications: Default::default(),
             next_deliverability_notifications: Default::default(),
             stats: Default::default(),
@@ -290,7 +252,7 @@ impl BackingPrivate for HypervisorBackedX86 {
                     &mut this.backing.stats.cpuid
                 }
                 HvMessageType::HvMessageTypeMsrIntercept => {
-                    intercept_handler.handle_msr_intercept(dev)?;
+                    intercept_handler.handle_msr_intercept()?;
                     &mut this.backing.stats.msr
                 }
                 HvMessageType::HvMessageTypeX64ApicEoi => {
@@ -300,10 +262,6 @@ impl BackingPrivate for HypervisorBackedX86 {
                 HvMessageType::HvMessageTypeUnrecoverableException => {
                     intercept_handler.handle_unrecoverable_exception()?;
                     &mut this.backing.stats.unrecoverable_exception
-                }
-                HvMessageType::HvMessageTypeX64Halt => {
-                    intercept_handler.handle_halt()?;
-                    &mut this.backing.stats.halt
                 }
                 HvMessageType::HvMessageTypeExceptionIntercept => {
                     intercept_handler.handle_exception()?;
@@ -332,60 +290,11 @@ impl BackingPrivate for HypervisorBackedX86 {
     }
 
     fn poll_apic(
-        this: &mut UhProcessor<'_, Self>,
-        vtl: GuestVtl,
-        scan_irr: bool,
+        _this: &mut UhProcessor<'_, Self>,
+        _vtl: GuestVtl,
+        _scan_irr: bool,
     ) -> Result<(), UhRunVpError> {
-        let Some(lapics) = this.backing.lapics.as_mut() else {
-            return Ok(());
-        };
-
-        let ApicWork {
-            init,
-            extint,
-            sipi,
-            nmi,
-            interrupt,
-        } = lapics[vtl].lapic.scan(&mut this.vmtime, scan_irr);
-
-        // TODO WHP GUEST VSM: An INIT/SIPI targeted at a VP with more than one guest VTL enabled is ignored.
-        if init {
-            this.handle_init(vtl)?;
-        }
-
-        if let Some(vector) = sipi {
-            this.handle_sipi(vtl, vector)?;
-        }
-
-        let Some(lapics) = this.backing.lapics.as_mut() else {
-            unreachable!()
-        };
-
-        // Interrupts are ignored while waiting for SIPI.
-        if lapics[vtl].activity != MpState::WaitForSipi {
-            if nmi || lapics[vtl].nmi_pending {
-                lapics[vtl].nmi_pending = true;
-                this.handle_nmi(vtl)?;
-            }
-
-            if let Some(vector) = interrupt {
-                this.handle_interrupt(vtl, vector)?;
-            }
-
-            if extint {
-                todo!();
-            }
-        }
-
         Ok(())
-    }
-
-    fn halt_in_usermode(this: &mut UhProcessor<'_, Self>, target_vtl: GuestVtl) -> bool {
-        if let Some(lapics) = this.backing.lapics.as_ref() {
-            lapics[target_vtl].activity != MpState::Running
-        } else {
-            false
-        }
     }
 
     fn handle_cross_vtl_interrupts(
@@ -408,12 +317,12 @@ impl BackingPrivate for HypervisorBackedX86 {
             .set_sints(this.backing.next_deliverability_notifications.sints() | sints);
     }
 
-    fn hv(&self, vtl: GuestVtl) -> Option<&ProcessorVtlHv> {
-        self.hv.as_ref().map(|arr| &arr[vtl])
+    fn hv(&self, _vtl: GuestVtl) -> Option<&ProcessorVtlHv> {
+        None
     }
 
-    fn hv_mut(&mut self, vtl: GuestVtl) -> Option<&mut ProcessorVtlHv> {
-        self.hv.as_mut().map(|arr| &mut arr[vtl])
+    fn hv_mut(&mut self, _vtl: GuestVtl) -> Option<&mut ProcessorVtlHv> {
+        None
     }
 
     fn untrusted_synic(&self) -> Option<&ProcessorSynic> {
@@ -423,29 +332,45 @@ impl BackingPrivate for HypervisorBackedX86 {
     fn untrusted_synic_mut(&mut self) -> Option<&mut ProcessorSynic> {
         None
     }
+
+    fn handle_vp_start_enable_vtl_wake(
+        _this: &mut UhProcessor<'_, Self>,
+        _vtl: GuestVtl,
+    ) -> Result<(), UhRunVpError> {
+        unimplemented!()
+    }
+
+    fn vtl1_inspectable(_this: &UhProcessor<'_, Self>) -> bool {
+        // TODO: Use the VsmVpStatus register to query the hypervisor for
+        // whether VTL 1 is enabled on the vp (this can be cached).
+        false
+    }
 }
 
 fn parse_sidecar_exit(message: &hvdef::HvMessage) -> SidecarRemoveExit {
     match message.header.typ {
         HvMessageType::HvMessageTypeX64IoPortIntercept => {
-            let message =
-                hvdef::HvX64IoPortInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+            let message = hvdef::HvX64IoPortInterceptMessage::ref_from_prefix(message.payload())
+                .unwrap()
+                .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
             SidecarRemoveExit::Io {
                 port: message.port_number,
                 write: message.header.intercept_access_type == HvInterceptAccessType::WRITE,
             }
         }
         HvMessageType::HvMessageTypeUnmappedGpa | HvMessageType::HvMessageTypeGpaIntercept => {
-            let message =
-                hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+            let message = hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(message.payload())
+                .unwrap()
+                .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
             SidecarRemoveExit::Mmio {
                 gpa: message.guest_physical_address,
                 write: message.header.intercept_access_type == HvInterceptAccessType::WRITE,
             }
         }
         HvMessageType::HvMessageTypeHypercallIntercept => {
-            let message =
-                hvdef::HvX64HypercallInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+            let message = hvdef::HvX64HypercallInterceptMessage::ref_from_prefix(message.payload())
+                .unwrap()
+                .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
             let is_64bit = message.header.execution_state.cr0_pe()
                 && message.header.execution_state.efer_lma();
             let control = if is_64bit {
@@ -458,16 +383,18 @@ fn parse_sidecar_exit(message: &hvdef::HvMessage) -> SidecarRemoveExit {
             }
         }
         HvMessageType::HvMessageTypeX64CpuidIntercept => {
-            let message =
-                hvdef::HvX64CpuidInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+            let message = hvdef::HvX64CpuidInterceptMessage::ref_from_prefix(message.payload())
+                .unwrap()
+                .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
             SidecarRemoveExit::Cpuid {
                 leaf: message.rax as u32,
                 subleaf: message.rcx as u32,
             }
         }
         HvMessageType::HvMessageTypeMsrIntercept => {
-            let message =
-                hvdef::HvX64MsrInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+            let message = hvdef::HvX64MsrInterceptMessage::ref_from_prefix(message.payload())
+                .unwrap()
+                .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
             SidecarRemoveExit::Msr {
                 msr: message.msr_number,
                 value: (message.header.intercept_access_type == HvInterceptAccessType::WRITE)
@@ -508,6 +435,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeUnmappedGpa
@@ -516,6 +444,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeUnacceptedGpa => {
@@ -523,6 +452,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeHypercallIntercept => {
@@ -530,6 +460,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeSynicSintDeliverable => {
@@ -537,6 +468,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeX64InterruptionDeliverable => {
@@ -544,6 +476,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeX64CpuidIntercept => {
@@ -551,6 +484,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeMsrIntercept => {
@@ -558,6 +492,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeUnrecoverableException => {
@@ -565,6 +500,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeX64Halt => {
@@ -572,6 +508,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         &HvMessageType::HvMessageTypeExceptionIntercept => {
@@ -579,6 +516,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
                                 vp.runner.exit_message().payload(),
                             )
                             .unwrap()
+                            .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: erro (https://github.com/microsoft/openvmm/issues/759)
                             .header
                         }
                         reason => unreachable!("unknown exit reason: {:#x?}", reason),
@@ -604,7 +542,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let message = hvdef::HvX64InterruptionDeliverableMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         assert_eq!(
             message.deliverable_type,
@@ -644,7 +583,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let message = hvdef::HvX64SynicSintDeliverableMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         tracing::trace!(
             deliverable_sints = message.deliverable_sints,
@@ -673,7 +613,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let message = hvdef::HvX64HypercallInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         tracing::trace!(msg = %format_args!("{:x?}", message), "hypercall");
 
@@ -702,7 +643,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let message = hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         tracing::trace!(msg = %format_args!("{:x?}", message), "mmio");
 
@@ -752,7 +694,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let message = hvdef::HvX64IoPortInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         tracing::trace!(msg = %format_args!("{:x?}", message), "io_port");
 
@@ -789,6 +732,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
             self.vp.runner.exit_message().payload(),
         )
         .unwrap()
+        .0 // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
         .guest_physical_address;
 
         if self.vp.partition.is_gpa_lower_vtl_ram(gpa) {
@@ -814,7 +758,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let message = hvdef::HvX64CpuidInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         let default_result = [
             message.default_result_rax as u32,
@@ -840,11 +785,12 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         self.vp.set_rip(self.intercepted_vtl, next_rip)
     }
 
-    fn handle_msr_intercept(&mut self, dev: &impl CpuIo) -> Result<(), VpHaltReason<UhRunVpError>> {
+    fn handle_msr_intercept(&mut self) -> Result<(), VpHaltReason<UhRunVpError>> {
         let message = hvdef::HvX64MsrInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
         let rip = next_rip(&message.header);
 
         tracing::trace!(msg = %format_args!("{:x?}", message), "msr");
@@ -852,23 +798,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         let msr = message.msr_number;
         match message.header.intercept_access_type {
             HvInterceptAccessType::READ => {
-                let r = if let Some(lapics) = &mut self.vp.backing.lapics {
-                    lapics[self.intercepted_vtl]
-                        .lapic
-                        .access(&mut UhApicClient {
-                            partition: self.vp.partition,
-                            runner: &mut self.vp.runner,
-                            vmtime: &self.vp.vmtime,
-                            dev,
-                            vtl: self.intercepted_vtl,
-                        })
-                        .msr_read(msr)
-                } else {
-                    Err(MsrError::Unknown)
-                };
-                let r = r.or_else_if_unknown(|| self.vp.read_msr(msr, self.intercepted_vtl));
-
-                let value = match r {
+                let value = match self.vp.read_msr(msr, self.intercepted_vtl) {
                     Ok(v) => v,
                     Err(MsrError::Unknown) => {
                         tracing::trace!(msr, "unknown msr read");
@@ -886,23 +816,7 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
             }
             HvInterceptAccessType::WRITE => {
                 let value = (message.rax & 0xffff_ffff) | (message.rdx << 32);
-                let r = if let Some(lapic) = &mut self.vp.backing.lapics {
-                    lapic[self.intercepted_vtl]
-                        .lapic
-                        .access(&mut UhApicClient {
-                            partition: self.vp.partition,
-                            runner: &mut self.vp.runner,
-                            vmtime: &self.vp.vmtime,
-                            dev,
-                            vtl: self.intercepted_vtl,
-                        })
-                        .msr_write(msr, value)
-                } else {
-                    Err(MsrError::Unknown)
-                };
-                let r =
-                    r.or_else_if_unknown(|| self.vp.write_msr(msr, value, self.intercepted_vtl));
-                match r {
+                match self.vp.write_msr(msr, value, self.intercepted_vtl) {
                     Ok(()) => {}
                     Err(MsrError::Unknown) => {
                         tracing::trace!(msr, value, "unknown msr write");
@@ -923,7 +837,8 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
     fn handle_eoi(&self, dev: &impl CpuIo) -> Result<(), VpHaltReason<UhRunVpError>> {
         let message =
             hvdef::HvX64ApicEoiMessage::ref_from_prefix(self.vp.runner.exit_message().payload())
-                .unwrap();
+                .unwrap()
+                .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         tracing::trace!(msg = %format_args!("{:x?}", message), "eoi");
 
@@ -937,16 +852,12 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
         })
     }
 
-    fn handle_halt(&mut self) -> Result<(), VpHaltReason<UhRunVpError>> {
-        self.vp.backing.lapics.as_mut().unwrap()[self.intercepted_vtl].activity = MpState::Halted;
-        Ok(())
-    }
-
     fn handle_exception(&mut self) -> Result<(), VpHaltReason<UhRunVpError>> {
         let message = hvdef::HvX64ExceptionInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         match x86defs::Exception(message.vector as u8) {
             x86defs::Exception::DEBUG if cfg!(feature = "gdb") => {
@@ -959,180 +870,6 @@ impl<'a, 'b> InterceptHandler<'a, 'b> {
 }
 
 impl UhProcessor<'_, HypervisorBackedX86> {
-    fn handle_interrupt(&mut self, vtl: GuestVtl, vector: u8) -> Result<(), UhRunVpError> {
-        const NAMES: &[HvX64RegisterName] = &[
-            HvX64RegisterName::Rflags,
-            HvX64RegisterName::Cr8,
-            HvX64RegisterName::InterruptState,
-            HvX64RegisterName::PendingInterruption,
-            HvX64RegisterName::PendingEvent0,
-        ];
-        let mut values = [0u32.into(); NAMES.len()];
-        self.runner
-            .get_vp_registers(vtl, NAMES, &mut values)
-            .map_err(UhRunVpError::EmulationState)?;
-
-        let &[rflags, cr8, interrupt_state, pending_interruption, pending_event] = &values;
-        let pending_interruption =
-            HvX64PendingInterruptionRegister::from(pending_interruption.as_u64());
-        let pending_event = HvX64PendingEventReg0::from(pending_event.as_u128());
-        let interrupt_state = HvX64InterruptStateRegister::from(interrupt_state.as_u64());
-        let rflags = RFlags::from(rflags.as_u64());
-        let cr8 = cr8.as_u64();
-
-        let priority = vector >> 4;
-
-        let lapic_state = &mut self.backing.lapics.as_mut().unwrap()[vtl];
-
-        // Exit idle when an interrupt is pending
-        if lapic_state.activity == MpState::Idle {
-            lapic_state.activity = MpState::Running;
-        }
-
-        if pending_interruption.interruption_pending()
-            || interrupt_state.interrupt_shadow()
-            || !rflags.interrupt_enable()
-            || cr8 >= priority as u64
-            || pending_event.event_pending()
-        {
-            if !self
-                .backing
-                .next_deliverability_notifications
-                .interrupt_notification()
-                || (self
-                    .backing
-                    .next_deliverability_notifications
-                    .interrupt_priority()
-                    != 0
-                    && self
-                        .backing
-                        .next_deliverability_notifications
-                        .interrupt_priority()
-                        < priority)
-            {
-                self.backing
-                    .next_deliverability_notifications
-                    .set_interrupt_notification(true);
-                self.backing
-                    .next_deliverability_notifications
-                    .set_interrupt_priority(priority);
-            }
-
-            return Ok(());
-        }
-
-        let interruption = HvX64PendingInterruptionRegister::new()
-            .with_interruption_type(HvX64PendingInterruptionType::HV_X64_PENDING_INTERRUPT.0)
-            .with_interruption_vector(vector.into())
-            .with_interruption_pending(true);
-
-        self.runner
-            .set_vp_register(
-                vtl,
-                HvX64RegisterName::PendingInterruption,
-                u64::from(interruption).into(),
-            )
-            .map_err(UhRunVpError::EmulationState)?;
-
-        lapic_state.activity = MpState::Running;
-        tracing::trace!(vector, "interrupted");
-        lapic_state.lapic.acknowledge_interrupt(vector);
-
-        Ok(())
-    }
-
-    fn handle_nmi(&mut self, vtl: GuestVtl) -> Result<(), UhRunVpError> {
-        const NAMES: &[HvX64RegisterName] = &[
-            HvX64RegisterName::InterruptState,
-            HvX64RegisterName::PendingInterruption,
-            HvX64RegisterName::PendingEvent0,
-        ];
-        let mut values = [0u32.into(); NAMES.len()];
-        self.runner
-            .get_vp_registers(vtl, NAMES, &mut values)
-            .map_err(UhRunVpError::EmulationState)?;
-
-        let &[interrupt_state, pending_interruption, pending_event] = &values;
-        let pending_interruption =
-            HvX64PendingInterruptionRegister::from(pending_interruption.as_u64());
-        let pending_event = HvX64PendingEventReg0::from(pending_event.as_u128());
-        let interrupt_state = HvX64InterruptStateRegister::from(interrupt_state.as_u64());
-        let lapic = &mut self.backing.lapics.as_mut().unwrap()[vtl];
-
-        // Exit idle when an interrupt is pending
-        if lapic.activity == MpState::Idle {
-            lapic.activity = MpState::Running;
-        }
-
-        if pending_interruption.interruption_pending()
-            || interrupt_state.nmi_masked()
-            || interrupt_state.interrupt_shadow()
-            || pending_event.event_pending()
-        {
-            if !self
-                .backing
-                .next_deliverability_notifications
-                .nmi_notification()
-            {
-                self.backing
-                    .next_deliverability_notifications
-                    .set_nmi_notification(true);
-            }
-
-            return Ok(());
-        }
-
-        let interruption = HvX64PendingInterruptionRegister::new()
-            .with_interruption_type(HvX64PendingInterruptionType::HV_X64_PENDING_NMI.0)
-            .with_interruption_vector(2)
-            .with_interruption_pending(true);
-
-        self.runner
-            .set_vp_register(
-                vtl,
-                HvX64RegisterName::PendingInterruption,
-                u64::from(interruption).into(),
-            )
-            .map_err(UhRunVpError::EmulationState)?;
-
-        lapic.activity = MpState::Running;
-        lapic.nmi_pending = false;
-
-        tracing::trace!("nmi");
-
-        Ok(())
-    }
-
-    fn handle_init(&mut self, vtl: GuestVtl) -> Result<(), UhRunVpError> {
-        let vp_info = self.inner.vp_info;
-        let mut access = self.access_state(vtl.into());
-        vp::x86_init(&mut access, &vp_info).map_err(UhRunVpError::State)
-    }
-
-    fn handle_sipi(&mut self, vtl: GuestVtl, vector: u8) -> Result<(), UhRunVpError> {
-        let lapic = &mut self.backing.lapics.as_mut().unwrap()[vtl];
-        if lapic.activity == MpState::WaitForSipi {
-            let address = (vector as u64) << 12;
-            let cs: hvdef::HvX64SegmentRegister = hvdef::HvX64SegmentRegister {
-                base: address,
-                limit: 0xffff,
-                selector: (address >> 4) as u16,
-                attributes: 0x9b,
-            };
-            self.runner
-                .set_vp_registers(
-                    vtl,
-                    [
-                        (HvX64RegisterName::Cs, HvRegisterValue::from(cs)),
-                        (HvX64RegisterName::Rip, 0u64.into()),
-                    ],
-                )
-                .map_err(UhRunVpError::EmulationState)?;
-            lapic.activity = MpState::Running;
-        }
-        Ok(())
-    }
-
     fn set_rip(&mut self, vtl: GuestVtl, rip: u64) -> Result<(), VpHaltReason<UhRunVpError>> {
         self.runner
             .set_vp_register(vtl, HvX64RegisterName::Rip, rip.into())
@@ -1280,7 +1017,7 @@ impl UhProcessor<'_, HypervisorBackedX86> {
             HvX64RegisterName::Cr0,
             HvX64RegisterName::Efer,
         ];
-        let mut values = [FromZeroes::new_zeroed(); NAMES.len()];
+        let mut values = [FromZeros::new_zeroed(); NAMES.len()];
         self.runner
             .get_vp_registers(vtl, NAMES, &mut values)
             .expect("register query should not fail");
@@ -1288,7 +1025,9 @@ impl UhProcessor<'_, HypervisorBackedX86> {
         let [rsp, es, ds, fs, gs, ss, cr0, efer] = values;
 
         let message = self.runner.exit_message();
-        let header = HvX64InterceptMessageHeader::ref_from_prefix(message.payload()).unwrap();
+        let header = HvX64InterceptMessageHeader::ref_from_prefix(message.payload())
+            .unwrap()
+            .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
 
         MshvEmulationCache {
             rsp: rsp.as_u64(),
@@ -1302,6 +1041,15 @@ impl UhProcessor<'_, HypervisorBackedX86> {
             rip: header.rip,
             rflags: header.rflags.into(),
         }
+    }
+}
+
+fn from_seg(reg: hvdef::HvX64SegmentRegister) -> SegmentRegister {
+    SegmentRegister {
+        base: reg.base,
+        limit: reg.limit,
+        selector: reg.selector,
+        attributes: reg.attributes.into(),
     }
 }
 
@@ -1366,8 +1114,9 @@ impl<T: CpuIo> EmulatorSupport for UhEmulationState<'_, '_, T, HypervisorBackedX
         match index {
             x86emu::Segment::CS => {
                 let message = self.vp.runner.exit_message();
-                let header =
-                    HvX64InterceptMessageHeader::ref_from_prefix(message.payload()).unwrap();
+                let header = HvX64InterceptMessageHeader::ref_from_prefix(message.payload())
+                    .unwrap()
+                    .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
                 from_seg(header.cs_segment)
             }
             x86emu::Segment::ES => self.cache.es,
@@ -1401,12 +1150,16 @@ impl<T: CpuIo> EmulatorSupport for UhEmulationState<'_, '_, T, HypervisorBackedX
             | HvMessageType::HvMessageTypeUnmappedGpa
             | HvMessageType::HvMessageTypeUnacceptedGpa => {
                 let message =
-                    hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+                    hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(message.payload())
+                        .unwrap()
+                        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
                 &message.instruction_bytes[..message.instruction_byte_count as usize]
             }
             HvMessageType::HvMessageTypeX64IoPortIntercept => {
                 let message =
-                    hvdef::HvX64IoPortInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+                    hvdef::HvX64IoPortInterceptMessage::ref_from_prefix(message.payload())
+                        .unwrap()
+                        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
                 &message.instruction_bytes[..message.instruction_byte_count as usize]
             }
             _ => unreachable!(),
@@ -1420,7 +1173,9 @@ impl<T: CpuIo> EmulatorSupport for UhEmulationState<'_, '_, T, HypervisorBackedX
             | HvMessageType::HvMessageTypeUnmappedGpa
             | HvMessageType::HvMessageTypeUnacceptedGpa => {
                 let message =
-                    hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(message.payload()).unwrap();
+                    hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(message.payload())
+                        .unwrap()
+                        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range (https://github.com/microsoft/openvmm/issues/759)
                 Some(message.guest_physical_address)
             }
             _ => None,
@@ -1439,7 +1194,8 @@ impl<T: CpuIo> EmulatorSupport for UhEmulationState<'_, '_, T, HypervisorBackedX
         let message = hvdef::HvX64MemoryInterceptMessage::ref_from_prefix(
             self.vp.runner.exit_message().payload(),
         )
-        .unwrap();
+        .unwrap()
+        .0; // TODO: zerocopy: ref-from-prefix: use-rest-of-range, zerocopy: err (https://github.com/microsoft/openvmm/issues/759)
 
         if !message.memory_access_info.gva_gpa_valid() {
             tracing::trace!(?message.guest_virtual_address, ?message.guest_physical_address, "gva gpa not valid {:?}", self.vp.runner.exit_message().payload());
@@ -1610,37 +1366,15 @@ impl<T: CpuIo> EmulatorSupport for UhEmulationState<'_, '_, T, HypervisorBackedX
     }
 
     fn lapic_base_address(&self) -> Option<u64> {
-        self.vp
-            .backing
-            .lapics
-            .as_ref()
-            .and_then(|lapic| lapic[self.vtl].lapic.base_address())
+        None
     }
 
-    fn lapic_read(&mut self, address: u64, data: &mut [u8]) {
-        self.vp.backing.lapics.as_mut().unwrap()[self.vtl]
-            .lapic
-            .access(&mut UhApicClient {
-                partition: self.vp.partition,
-                runner: &mut self.vp.runner,
-                vmtime: &self.vp.vmtime,
-                dev: self.devices,
-                vtl: self.vtl,
-            })
-            .mmio_read(address, data);
+    fn lapic_read(&mut self, _address: u64, _data: &mut [u8]) {
+        unimplemented!()
     }
 
-    fn lapic_write(&mut self, address: u64, data: &[u8]) {
-        self.vp.backing.lapics.as_mut().unwrap()[self.vtl]
-            .lapic
-            .access(&mut UhApicClient {
-                partition: self.vp.partition,
-                runner: &mut self.vp.runner,
-                vmtime: &self.vp.vmtime,
-                dev: self.devices,
-                vtl: self.vtl,
-            })
-            .mmio_write(address, data);
+    fn lapic_write(&mut self, _address: u64, _data: &[u8]) {
+        unimplemented!()
     }
 }
 
@@ -1651,7 +1385,6 @@ impl<T: CpuIo> UhHypercallHandler<'_, '_, T, HypervisorBackedX86> {
             hv1_hypercall::HvPostMessage,
             hv1_hypercall::HvSignalEvent,
             hv1_hypercall::HvRetargetDeviceInterrupt,
-            hv1_hypercall::HvX64StartVirtualProcessor,
             hv1_hypercall::HvGetVpIndexFromApicId,
             hv1_hypercall::HvSetVpRegisters,
             hv1_hypercall::HvModifyVtlProtectionMask
@@ -1663,6 +1396,7 @@ impl<T> hv1_hypercall::X64RegisterState for UhHypercallHandler<'_, '_, T, Hyperv
     fn rip(&mut self) -> u64 {
         HvX64InterceptMessageHeader::ref_from_prefix(self.vp.runner.exit_message().payload())
             .unwrap()
+            .0
             .rip
     }
 
@@ -1821,7 +1555,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, HypervisorBackedX86> {
         //
         // This is just used for debugging, so this should not be a problem.
         #[repr(C)]
-        #[derive(AsBytes)]
+        #[derive(IntoBytes, Immutable, KnownLayout)]
         struct XsaveStandard {
             fxsave: Fxsave,
             xsave_header: XsaveHeader,
@@ -1830,7 +1564,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, HypervisorBackedX86> {
             fxsave: self.vp.runner.cpu_context().fx_state.clone(),
             xsave_header: XsaveHeader {
                 xstate_bv: XFEATURE_X87 | XFEATURE_SSE,
-                ..FromZeroes::new_zeroed()
+                ..FromZeros::new_zeroed()
             },
         };
         Ok(vp::Xsave::from_standard(state.as_bytes(), self.caps()))
@@ -1984,7 +1718,7 @@ impl<T: CpuIo> hv1_hypercall::RetargetDeviceInterrupt
         device_id: u64,
         address: u64,
         data: u32,
-        params: &hv1_hypercall::HvInterruptParameters<'_>,
+        params: hv1_hypercall::HvInterruptParameters<'_>,
     ) -> hvdef::HvResult<()> {
         self.retarget_virtual_interrupt(
             device_id,
@@ -2004,7 +1738,7 @@ impl<T> hv1_hypercall::SetVpRegisters for UhHypercallHandler<'_, '_, T, Hypervis
         vp_index: u32,
         vtl: Option<Vtl>,
         registers: &[hypercall::HvRegisterAssoc],
-    ) -> hvdef::HvRepResult {
+    ) -> HvRepResult {
         if partition_id != hvdef::HV_PARTITION_ID_SELF {
             return Err((HvError::AccessDenied, 0));
         }
@@ -2041,7 +1775,7 @@ impl<T> hv1_hypercall::ModifyVtlProtectionMask
         _map_flags: HvMapGpaFlags,
         target_vtl: Option<Vtl>,
         gpa_pages: &[u64],
-    ) -> hvdef::HvRepResult {
+    ) -> HvRepResult {
         if partition_id != hvdef::HV_PARTITION_ID_SELF {
             return Err((HvError::AccessDenied, 0));
         }
@@ -2091,55 +1825,6 @@ impl<T> hv1_hypercall::ModifyVtlProtectionMask
     }
 }
 
-struct UhApicClient<'a, 'b, T> {
-    partition: &'a UhPartitionInner,
-    runner: &'a mut ProcessorRunner<'b, MshvX64>,
-    dev: &'a T,
-    vmtime: &'a VmTimeAccess,
-    vtl: GuestVtl,
-}
-
-impl<T: CpuIo> ApicClient for UhApicClient<'_, '_, T> {
-    fn cr8(&mut self) -> u32 {
-        self.runner
-            .get_vp_register(self.vtl, HvX64RegisterName::Cr8)
-            .unwrap()
-            .as_u32()
-    }
-
-    fn set_cr8(&mut self, value: u32) {
-        self.runner
-            .set_vp_register(self.vtl, HvX64RegisterName::Cr8, value.into())
-            .unwrap();
-    }
-
-    fn set_apic_base(&mut self, value: u64) {
-        self.runner
-            .set_vp_register(self.vtl, HvX64RegisterName::ApicBase, value.into())
-            .unwrap();
-    }
-
-    fn wake(&mut self, vp_index: VpIndex) {
-        self.partition
-            .vp(vp_index)
-            .unwrap()
-            .wake(self.vtl, WakeReason::INTCON);
-    }
-
-    fn eoi(&mut self, vector: u8) {
-        debug_assert_eq!(self.vtl, GuestVtl::Vtl0);
-        self.dev.handle_eoi(vector.into())
-    }
-
-    fn now(&mut self) -> VmTime {
-        self.vmtime.now()
-    }
-
-    fn pull_offload(&mut self) -> ([u32; 8], [u32; 8]) {
-        unreachable!()
-    }
-}
-
 mod save_restore {
     use super::HypervisorBackedX86;
     use super::UhProcessor;
@@ -2155,8 +1840,8 @@ mod save_restore {
     use vmcore::save_restore::RestoreError;
     use vmcore::save_restore::SaveError;
     use vmcore::save_restore::SaveRestore;
-    use zerocopy::AsBytes;
-    use zerocopy::FromZeroes;
+    use zerocopy::FromZeros;
+    use zerocopy::IntoBytes;
 
     mod state {
         use mesh::payload::Protobuf;
@@ -2254,7 +1939,7 @@ mod save_restore {
                 .map_err(SaveError::Other)?;
 
             let dr6_shared = self.partition.hcl.dr6_shared();
-            let mut values = [FromZeroes::new_zeroed(); SHARED_REGISTERS.len()];
+            let mut values = [FromZeros::new_zeroed(); SHARED_REGISTERS.len()];
             let len = if dr6_shared {
                 SHARED_REGISTERS.len()
             } else {
@@ -2316,8 +2001,6 @@ mod save_restore {
                         // Topology information
                         vp_info: _,
                         cpu_index: _,
-                        // Only relevant for CVMs
-                        hcvm_vtl1_enabled: _,
                         hv_start_enable_vtl_vp: _,
                     },
                 // Saved
@@ -2449,7 +2132,7 @@ mod save_restore {
             self.runner
                 .cpu_context_mut()
                 .fx_state
-                .as_bytes_mut()
+                .as_mut_bytes()
                 .copy_from_slice(&fx_state);
 
             self.crash_reg = crash_reg.unwrap_or_default();
@@ -2497,7 +2180,7 @@ mod save_restore {
                         HvX64RegisterName::Cr0,
                         HvX64RegisterName::Efer,
                     ];
-                    let mut values = [FromZeroes::new_zeroed(); NAMES.len()];
+                    let mut values = [FromZeros::new_zeroed(); NAMES.len()];
                     self.runner
                         // Non-VTL0 VPs should never be in startup suspend, so we only need to handle VTL0.
                         .get_vp_registers(GuestVtl::Vtl0, &NAMES, &mut values)

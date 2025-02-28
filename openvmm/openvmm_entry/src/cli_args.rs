@@ -102,11 +102,6 @@ pub struct Options {
     #[clap(long, requires("vtl2"))]
     pub no_alias_map: bool,
 
-    /// The vtl2 paravisor has an APIC emulator, so do not emulate lower VTL
-    /// APICs on the host.
-    #[clap(long, requires("vtl2"))]
-    pub vtl2_emulates_apic: bool,
-
     /// enable isolation emulation
     #[clap(long, requires("vtl2"))]
     pub isolation: Option<IsolationCli>,
@@ -381,7 +376,7 @@ flags:
     ///
     /// Used internally for debugging and diagnostics.
     #[clap(long, default_value = "control", hide(true))]
-    #[allow(clippy::option_option)]
+    #[expect(clippy::option_option)]
     pub internal_worker: Option<Option<String>>,
 
     /// redirect the VTL 0 vmbus control plane to a proxy in VTL 2.

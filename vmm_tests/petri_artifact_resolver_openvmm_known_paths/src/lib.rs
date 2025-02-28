@@ -11,16 +11,22 @@ use petri_artifacts_core::ErasedArtifactHandle;
 use std::env::consts::EXE_EXTENSION;
 use std::path::Path;
 use std::path::PathBuf;
-use tempfile::TempDir;
 use vmm_test_images::KnownIso;
 use vmm_test_images::KnownVhd;
 
-/// An implementation of [`petri_artifacts_core::TestArtifactResolverBackend`]
+/// An implementation of [`petri_artifacts_core::ResolveTestArtifact`]
 /// that resolves artifacts to various "known paths" within the context of
 /// the OpenVMM repository.
-pub struct OpenvmmKnownPathsTestArtifactResolver;
+pub struct OpenvmmKnownPathsTestArtifactResolver<'a>(&'a str);
 
-impl petri_artifacts_core::TestArtifactResolverBackend for OpenvmmKnownPathsTestArtifactResolver {
+impl<'a> OpenvmmKnownPathsTestArtifactResolver<'a> {
+    /// Creates a new resolver for a test with the given name.
+    pub fn new(test_name: &'a str) -> Self {
+        Self(test_name)
+    }
+}
+
+impl petri_artifacts_core::ResolveTestArtifact for OpenvmmKnownPathsTestArtifactResolver<'_> {
     #[rustfmt::skip]
     fn resolve(&self, id: ErasedArtifactHandle) -> anyhow::Result<PathBuf> {
         use petri_artifacts_common::artifacts as common;
@@ -32,10 +38,9 @@ impl petri_artifacts_core::TestArtifactResolverBackend for OpenvmmKnownPathsTest
             _ if id == common::PIPETTE_WINDOWS_AARCH64 => pipette_path(MachineArch::Aarch64, PipetteFlavor::Windows),
             _ if id == common::PIPETTE_LINUX_AARCH64 => pipette_path(MachineArch::Aarch64, PipetteFlavor::Linux),
 
-            _ if id == common::TEST_LOG_DIRECTORY => test_log_directory_path(),
+            _ if id == common::TEST_LOG_DIRECTORY => test_log_directory_path(self.0),
 
             _ if id == OPENVMM_NATIVE => openvmm_native_executable_path(),
-            _ if id == OPENHCL_DUMP_DIRECTORY => openhcl_dump_path(),
 
             _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_X64 => linux_direct_x64_test_kernel_path(),
             _ if id == loadable::LINUX_DIRECT_TEST_KERNEL_AARCH64 => linux_direct_arm_image_path(),
@@ -348,30 +353,18 @@ fn openhcl_extras_path(
     )
 }
 
-/// Path to our standard test output directory.
-fn test_log_directory_path() -> anyhow::Result<PathBuf> {
-    Ok(if let Some(path) = std::env::var_os("TEST_OUTPUT_PATH") {
+/// Path to the per-test test output directory.
+fn test_log_directory_path(test_name: &str) -> anyhow::Result<PathBuf> {
+    let root = if let Some(path) = std::env::var_os("TEST_OUTPUT_PATH") {
         PathBuf::from(path)
     } else {
         get_repo_root()?.join("vmm_test_results")
-    })
-}
-
-/// Path to the location for OpenHCL crash dump files.
-fn openhcl_dump_path() -> anyhow::Result<PathBuf> {
-    static DUMP_PATH: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
-    Ok(
-        if let Some(path) = std::env::var_os("OPENHCL_DUMP_PATH")
-            .or_else(|| std::env::var_os("HVLITE_UNDERHILL_DUMP_PATH"))
-        {
-            PathBuf::from(path)
-        } else {
-            DUMP_PATH
-                .get_or_init(|| TempDir::new().unwrap())
-                .path()
-                .to_owned()
-        },
-    )
+    };
+    // Use a per-test subdirectory, replacing `::` with `__` to avoid issues
+    // with filesystems that don't support `::` in filenames.
+    let path = root.join(test_name.replace("::", "__"));
+    fs_err::create_dir_all(&path)?;
+    Ok(path)
 }
 
 const VMM_TESTS_DIR_ENV_VAR: &str = "VMM_TESTS_CONTENT_DIR";

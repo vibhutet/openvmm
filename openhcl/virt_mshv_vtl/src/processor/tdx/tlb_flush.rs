@@ -10,11 +10,13 @@ use hcl::ioctl::ProcessorRunner;
 use hcl::GuestVtl;
 use hvdef::hypercall::HvGvaRange;
 use inspect::Inspect;
+use safeatomic::AtomicSliceOps;
 use std::collections::VecDeque;
 use std::num::Wrapping;
 use x86defs::tdx::TdGlaVmAndFlags;
 use x86defs::tdx::TdxGlaListInfo;
-use zerocopy::AsBytes;
+use x86defs::tdx::TdxVmFlags;
+use zerocopy::IntoBytes;
 
 pub(super) const FLUSH_GVA_LIST_SIZE: usize = 32;
 
@@ -71,6 +73,7 @@ impl UhProcessor<'_, TdxBacked> {
     /// Completes any pending TLB flush activity on the current VP.
     pub(super) fn do_tlb_flush(&mut self, target_vtl: GuestVtl) {
         let partition_flush_state = self.shared.flush_state[target_vtl].read();
+        let self_flush_state = &mut self.backing.vtls[target_vtl].flush_state;
 
         // NOTE: It is theoretically possible that we haven't run in so long
         // that the partition counters have wrapped all the way around u32::MAX
@@ -78,9 +81,7 @@ impl UhProcessor<'_, TdxBacked> {
         // unlikely that we don't bother to worry about it.
 
         // Check first to see whether a full flush is required.
-        let flush_entire_required = if self.backing.vtls[target_vtl]
-            .flush_state
-            .flush_entire_counter
+        let flush_entire_required = if self_flush_state.flush_entire_counter
             != partition_flush_state.s.flush_entire_counter
         {
             true
@@ -90,19 +91,20 @@ impl UhProcessor<'_, TdxBacked> {
             !Self::try_flush_list(
                 target_vtl,
                 &partition_flush_state,
-                &mut self.backing.vtls[target_vtl].flush_state.gva_list_count,
+                &mut self_flush_state.gva_list_count,
                 &mut self.runner,
                 &self.backing.flush_page,
             )
         };
 
-        let self_flush_state = &mut self.backing.vtls[target_vtl].flush_state;
-
         // If a flush entire is required, then complete the flush and update the
         // flush counters to indicate that a complete flush has been accomplished.
         if flush_entire_required {
             *self_flush_state = partition_flush_state.s.clone();
-            Self::do_flush_entire(false, &mut self.runner);
+            Self::set_flush_entire(
+                true,
+                &mut self.backing.vtls[target_vtl].private_regs.vp_entry_flags,
+            );
         }
         // If no flush entire is required, then check to see whether a full
         // non-global flush is required.
@@ -111,7 +113,10 @@ impl UhProcessor<'_, TdxBacked> {
         {
             self_flush_state.flush_entire_non_global_counter =
                 partition_flush_state.s.flush_entire_non_global_counter;
-            Self::do_flush_entire(true, &mut self.runner);
+            Self::set_flush_entire(
+                false,
+                &mut self.backing.vtls[target_vtl].private_regs.vp_entry_flags,
+            );
         }
     }
 
@@ -121,8 +126,8 @@ impl UhProcessor<'_, TdxBacked> {
         target_vtl: GuestVtl,
         partition_flush_state: &TdxPartitionFlushState,
         gva_list_count: &mut Wrapping<usize>,
-        runner: &mut ProcessorRunner<'_, Tdx>,
-        flush_page: &page_pool_alloc::PagePoolHandle,
+        runner: &mut ProcessorRunner<'_, Tdx<'_>>,
+        flush_page: &user_driver::memory::MemoryBlock,
     ) -> bool {
         // Check quickly to see whether any new addresses are in the list.
         if partition_flush_state.s.gva_list_count == *gva_list_count {
@@ -146,31 +151,23 @@ impl UhProcessor<'_, TdxBacked> {
 
         if count_diff == 1 {
             let gva_range = flush_addrs.next().unwrap();
-            // Any extended entry can't be handled, promote to a flush entire.
-            if gva_range.as_extended().large_page() {
-                return false;
-            }
             runner
                 .invgla(gla_flags, TdxGlaListInfo::from(gva_range.0))
                 .unwrap();
         } else {
             gla_flags.set_list(true);
 
-            let page_mapping = flush_page.mapping().unwrap();
+            let page_mapping = flush_page.as_slice();
 
-            for (i, gva_range) in flush_addrs.enumerate() {
-                // Any extended entry can't be handled, promote to a flush entire.
-                if gva_range.as_extended().large_page() {
-                    return false;
-                }
-
-                page_mapping
-                    .write_at(i * size_of::<HvGvaRange>(), gva_range.as_bytes())
-                    .unwrap();
+            for (d, s) in page_mapping
+                .chunks(size_of::<HvGvaRange>())
+                .zip(flush_addrs)
+            {
+                d.atomic_write(s.as_bytes());
             }
 
             let gla_list = TdxGlaListInfo::new()
-                .with_list_gpa(flush_page.base_pfn())
+                .with_list_gpa(flush_page.pfns()[0])
                 .with_num_entries(count_diff as u64);
             runner.invgla(gla_flags, gla_list).unwrap();
         };
@@ -179,13 +176,11 @@ impl UhProcessor<'_, TdxBacked> {
         true
     }
 
-    fn do_flush_entire(non_global: bool, runner: &mut ProcessorRunner<'_, Tdx>) {
-        let vp_flags = runner.tdx_vp_entry_flags_mut();
-
-        if !non_global {
+    fn set_flush_entire(global: bool, vp_flags: &mut TdxVmFlags) {
+        if global {
             // TODO: Track EPT invalidations separately.
             vp_flags.set_invd_translations(x86defs::tdx::TDX_VP_ENTER_INVD_INVEPT);
-        } else if non_global && vp_flags.invd_translations() == 0 {
+        } else if !global && vp_flags.invd_translations() == 0 {
             vp_flags.set_invd_translations(x86defs::tdx::TDX_VP_ENTER_INVD_INVVPID_NON_GLOBAL);
         }
     }

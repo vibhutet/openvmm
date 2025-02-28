@@ -11,6 +11,7 @@ rust-version.workspace = true
 tests = ["dep:tempfile"]
 
 [dependencies]
+loan_cell.workspace = true
 pal.workspace = true
 unix_socket.workspace = true
 pal_event.workspace = true
@@ -29,11 +30,11 @@ socket2 = { workspace = true, features = ["all"] }
 tempfile = { workspace = true, optional = true }
 unicycle.workspace = true
 zerocopy.workspace = true
-
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true, features = ["extra_traits"] }
 
 [target.'cfg(windows)'.dependencies]
+headervec.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_WindowsProgramming"] }
 
 # TODO: move all these uses to windows-sys.

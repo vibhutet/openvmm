@@ -16,19 +16,24 @@ use super::UhHypercallHandler;
 use super::UhRunVpError;
 use crate::BackingShared;
 use crate::GuestVtl;
+use crate::TlbFlushLockAccess;
 use crate::UhCvmPartitionState;
 use crate::UhCvmVpState;
 use crate::UhPartitionInner;
 use crate::UhProcessor;
 use crate::WakeReason;
 use hcl::ioctl::tdx::Tdx;
+use hcl::ioctl::tdx::TdxPrivateRegs;
 use hcl::ioctl::ProcessorRunner;
 use hcl::protocol::hcl_intr_offload_flags;
 use hcl::protocol::tdx_tdg_vp_enter_exit_info;
 use hv1_emulator::hv::ProcessorVtlHv;
 use hv1_emulator::synic::ProcessorSynic;
 use hv1_hypercall::AsHandler;
+use hv1_hypercall::HvRepResult;
 use hv1_hypercall::HypercallIo;
+use hv1_structs::ProcessorSet;
+use hv1_structs::VtlArray;
 use hvdef::hypercall::HvFlushFlags;
 use hvdef::hypercall::HvGvaRange;
 use hvdef::HvError;
@@ -41,7 +46,8 @@ use inspect::Inspect;
 use inspect::InspectMut;
 use inspect_counters::Counter;
 use parking_lot::RwLock;
-use std::num::NonZeroU64;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use thiserror::Error;
 use tlb_flush::TdxFlushState;
 use tlb_flush::TdxPartitionFlushState;
@@ -60,7 +66,6 @@ use virt::Processor;
 use virt::VpHaltReason;
 use virt::VpIndex;
 use virt_support_apic::ApicClient;
-use virt_support_apic::ApicWork;
 use virt_support_apic::OffloadNotSupported;
 use virt_support_x86emu::emulate::emulate_io;
 use virt_support_x86emu::emulate::emulate_translate_gva;
@@ -68,15 +73,13 @@ use virt_support_x86emu::emulate::EmulatorSupport as X86EmulatorSupport;
 use virt_support_x86emu::emulate::TranslateMode;
 use virt_support_x86emu::translate::TranslationRegisters;
 use vmcore::vmtime::VmTimeAccess;
-use vtl_array::VtlArray;
 use x86defs::apic::X2APIC_MSR_BASE;
 use x86defs::cpuid::CpuidFunction;
 use x86defs::tdx::TdCallResultCode;
 use x86defs::tdx::TdVmCallR10Result;
+use x86defs::tdx::TdxGp;
 use x86defs::tdx::TdxInstructionInfo;
 use x86defs::tdx::TdxL2Ctls;
-use x86defs::tdx::TdxL2EnterGuestState;
-use x86defs::tdx::TdxVmFlags;
 use x86defs::tdx::TdxVpEnterRaxResult;
 use x86defs::vmx::ApicPage;
 use x86defs::vmx::ApicRegister;
@@ -267,10 +270,10 @@ impl VirtualRegister {
     /// Write a new value to the virtual register. This updates host owned bits
     /// in the shadowed value, and updates guest owned bits in the physical
     /// register in the vmcs.
-    fn write(
+    fn write<'a>(
         &mut self,
         value: u64,
-        runner: &mut ProcessorRunner<'_, Tdx>,
+        runner: &mut ProcessorRunner<'a, Tdx<'a>>,
     ) -> Result<(), VirtualRegisterError> {
         tracing::trace!(?self.register, value, "write virtual register");
 
@@ -307,7 +310,7 @@ impl VirtualRegister {
         Ok(())
     }
 
-    fn read(&self, runner: &ProcessorRunner<'_, Tdx>) -> u64 {
+    fn read(&self, runner: &ProcessorRunner<'_, Tdx<'_>>) -> u64 {
         let physical_reg = runner.read_vmcs64(self.vtl, self.register.physical_vmcs_field());
 
         // Get the bits owned by the host from the shadow and the bits owned by the
@@ -394,20 +397,13 @@ pub struct TdxBacked {
     #[inspect(mut)]
     vtls: VtlArray<TdxVtl, 2>,
 
-    /// PFNs used for overlays.
-    #[inspect(iter_by_index)]
-    direct_overlays_pfns: [u64; UhDirectOverlay::Count as usize],
-    #[inspect(skip)]
-    #[allow(dead_code)] // Allocation handle for direct overlays held until drop
-    direct_overlay_pfns_handle: page_pool_alloc::PagePoolHandle,
-
     untrusted_synic: Option<ProcessorSynic>,
     #[inspect(with = "|x| inspect::iter_by_index(x).map_value(inspect::AsHex)")]
     eoi_exit_bitmap: [u64; 4],
 
     /// A mapped page used for issuing INVGLA hypercalls.
     #[inspect(skip)]
-    flush_page: page_pool_alloc::PagePoolHandle,
+    flush_page: user_driver::memory::MemoryBlock,
 
     cvm: UhCvmVpState,
 }
@@ -430,6 +426,9 @@ struct TdxVtl {
     interruption_information: InterruptionInformation,
     exception_error_code: u32,
     interruption_set: bool,
+
+    #[inspect(mut)]
+    private_regs: TdxPrivateRegs,
 
     /// TDX only TLB flush state.
     flush_state: TdxFlushState,
@@ -476,11 +475,6 @@ pub struct ExitStats {
     pub exception: Counter,
 }
 
-/// The number of shared pages required per cpu.
-pub const fn shared_pages_required_per_cpu() -> u64 {
-    UhDirectOverlay::Count as u64
-}
-
 enum UhDirectOverlay {
     Sipp,
     Sifp,
@@ -488,6 +482,10 @@ enum UhDirectOverlay {
 }
 
 impl HardwareIsolatedBacking for TdxBacked {
+    fn shared_pages_required_per_cpu() -> u64 {
+        UhDirectOverlay::Count as u64
+    }
+
     fn cvm_state_mut(&mut self) -> &mut UhCvmVpState {
         &mut self.cvm
     }
@@ -496,13 +494,11 @@ impl HardwareIsolatedBacking for TdxBacked {
         &shared.cvm
     }
 
-    fn switch_vtl_state(
-        _this: &mut UhProcessor<'_, Self>,
-        _source_vtl: GuestVtl,
-        _target_vtl: GuestVtl,
-    ) {
-        // TODO TDX GUEST VSM
-        todo!()
+    fn switch_vtl(this: &mut UhProcessor<'_, Self>, _source_vtl: GuestVtl, target_vtl: GuestVtl) {
+        // The GPs, Fxsave, and CR2 are saved in the shared kernel state. No copying needed.
+        // Debug registers and XFEM are shared architecturally. No copying needed.
+
+        this.backing.cvm_state_mut().exit_vtl = target_vtl;
     }
 
     fn translation_registers(
@@ -515,7 +511,7 @@ impl HardwareIsolatedBacking for TdxBacked {
         let efer = this.backing.vtls[vtl].efer;
         let cr3 = this.runner.read_vmcs64(vtl, VmcsField::VMX_VMCS_GUEST_CR3);
         let ss = this.read_segment(vtl, TdxSegmentReg::Ss).into();
-        let rflags = this.runner.tdx_enter_guest_state().rflags;
+        let rflags = this.backing.vtls[vtl].private_regs.rflags;
 
         TranslationRegisters {
             cr0,
@@ -535,8 +531,10 @@ impl HardwareIsolatedBacking for TdxBacked {
 /// Partition-wide shared data for TDX VPs.
 #[derive(Inspect)]
 pub struct TdxBackedShared {
-    cvm: UhCvmPartitionState,
+    pub(crate) cvm: UhCvmPartitionState,
     flush_state: VtlArray<RwLock<TdxPartitionFlushState>, 2>,
+    #[inspect(iter_by_index)]
+    active_vtl: Vec<AtomicU8>,
 }
 
 impl TdxBackedShared {
@@ -544,12 +542,16 @@ impl TdxBackedShared {
         Ok(Self {
             flush_state: VtlArray::from_fn(|_| RwLock::new(TdxPartitionFlushState::new())),
             cvm: params.cvm_state.unwrap(),
+            // VPs start in VTL 2.
+            active_vtl: std::iter::repeat_n(2, params.vp_count as usize)
+                .map(AtomicU8::new)
+                .collect(),
         })
     }
 }
 
 impl BackingPrivate for TdxBacked {
-    type HclBacking = Tdx;
+    type HclBacking<'tdx> = Tdx<'tdx>;
     type Shared = TdxBackedShared;
     type EmulationCache = TdxEmulationCache;
 
@@ -562,7 +564,7 @@ impl BackingPrivate for TdxBacked {
 
     fn new(
         params: super::private::BackingParams<'_, '_, Self>,
-        _shared: &TdxBackedShared,
+        shared: &TdxBackedShared,
     ) -> Result<Self, crate::Error> {
         // TODO TDX: TDX shares the vp context page for xmm registers only. It
         // should probably move to its own page.
@@ -574,22 +576,11 @@ impl BackingPrivate for TdxBacked {
 
         let regs = Registers::at_reset(&params.partition.caps, params.vp_info);
 
-        let TdxL2EnterGuestState {
-            gps,
-            rflags,
-            rip,
-            ssp: _,
-            rvi: _,
-            svi: _,
-            reserved: _,
-        } = params.runner.tdx_enter_guest_state_mut();
-
+        let gps = params.runner.tdx_enter_guest_gps_mut();
         *gps = [
             regs.rax, regs.rcx, regs.rdx, regs.rbx, regs.rsp, regs.rbp, regs.rsi, regs.rdi,
             regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15,
         ];
-        *rflags = regs.rflags;
-        *rip = regs.rip;
 
         // TODO TDX: ssp is for shadow stack
 
@@ -676,27 +667,13 @@ impl BackingPrivate for TdxBacked {
             }
         }
 
-        // Allocate PFNs for direct overlays
-        let pfns_handle = params
-            .partition
-            .shared_vis_pages_pool
-            .as_ref()
-            .expect("must have shared vis pool when using SNP")
-            .alloc(
-                NonZeroU64::new(shared_pages_required_per_cpu()).expect("is nonzero"),
-                format!("direct overlay vp {}", params.vp_info.base.vp_index.index()),
-            )
-            .map_err(super::Error::AllocateSharedVisOverlay)?;
-        let pfns = pfns_handle.base_pfn()..pfns_handle.base_pfn() + pfns_handle.size_pages();
-        let overlays: Vec<_> = pfns.collect();
-
         let flush_page = params
             .partition
-            .private_vis_pages_pool
+            .private_dma_client
             .as_ref()
-            .expect("private pool exists for cvm")
-            .alloc_with_mapping(1.try_into().unwrap(), "tdx_tlb_flush".into())
-            .expect("not out of memory");
+            .ok_or(crate::Error::MissingPrivateMemory)?
+            .allocate_dma_buffer(HV_PAGE_SIZE as usize)
+            .map_err(crate::Error::AllocateTlbFlushPage)?;
 
         let untrusted_synic = params
             .partition
@@ -726,48 +703,44 @@ impl BackingPrivate for TdxBacked {
         }
 
         Ok(Self {
-            vtls: VtlArray::from_fn(|vtl| TdxVtl {
-                efer: regs.efer,
-                cr0: VirtualRegister::new(
-                    ShadowedRegister::Cr0,
-                    vtl.try_into().unwrap(),
-                    regs.cr0,
-                    None,
-                ),
-                cr4: VirtualRegister::new(
-                    ShadowedRegister::Cr4,
-                    vtl.try_into().unwrap(),
-                    regs.cr4,
-                    Some(allowed_cr4_bits),
-                ),
-                tpr_threshold: 0,
-                processor_controls: params
-                    .runner
-                    .read_vmcs32(
-                        vtl.try_into().unwrap(),
-                        VmcsField::VMX_VMCS_PROCESSOR_CONTROLS,
-                    )
-                    .into(),
-                secondary_processor_controls: params
-                    .runner
-                    .read_vmcs32(
-                        vtl.try_into().unwrap(),
-                        VmcsField::VMX_VMCS_SECONDARY_PROCESSOR_CONTROLS,
-                    )
-                    .into(),
-                interruption_information: Default::default(),
-                exception_error_code: 0,
-                interruption_set: false,
-                flush_state: TdxFlushState::new(),
-                enter_stats: Default::default(),
-                exit_stats: Default::default(),
+            vtls: VtlArray::from_fn(|vtl| {
+                let vtl: GuestVtl = vtl.try_into().unwrap();
+                TdxVtl {
+                    efer: regs.efer,
+                    cr0: VirtualRegister::new(ShadowedRegister::Cr0, vtl, regs.cr0, None),
+                    cr4: VirtualRegister::new(
+                        ShadowedRegister::Cr4,
+                        vtl,
+                        regs.cr4,
+                        Some(allowed_cr4_bits),
+                    ),
+                    tpr_threshold: 0,
+                    processor_controls: params
+                        .runner
+                        .read_vmcs32(vtl, VmcsField::VMX_VMCS_PROCESSOR_CONTROLS)
+                        .into(),
+                    secondary_processor_controls: params
+                        .runner
+                        .read_vmcs32(vtl, VmcsField::VMX_VMCS_SECONDARY_PROCESSOR_CONTROLS)
+                        .into(),
+                    interruption_information: Default::default(),
+                    exception_error_code: 0,
+                    interruption_set: false,
+                    flush_state: TdxFlushState::new(),
+                    private_regs: TdxPrivateRegs::new(regs.rflags, regs.rip, vtl),
+                    enter_stats: Default::default(),
+                    exit_stats: Default::default(),
+                }
             }),
-            direct_overlays_pfns: overlays.try_into().unwrap(),
-            direct_overlay_pfns_handle: pfns_handle,
             untrusted_synic,
             eoi_exit_bitmap: [0; 4],
             flush_page,
-            cvm: UhCvmVpState::new(params.hv.unwrap(), params.lapics.unwrap()),
+            cvm: UhCvmVpState::new(
+                &shared.cvm,
+                params.partition,
+                params.vp_info,
+                UhDirectOverlay::Count as usize,
+            )?,
         })
     }
 
@@ -789,7 +762,7 @@ impl BackingPrivate for TdxBacked {
         // when VTL 1 is enabled.
 
         // Configure the synic overlays.
-        let pfns = &this.backing.direct_overlays_pfns;
+        let pfns = &this.backing.cvm.direct_overlay_handle.pfns();
         let reg = |gpn| {
             u64::from(
                 HvSynicSimpSiefp::new()
@@ -854,7 +827,7 @@ impl BackingPrivate for TdxBacked {
             // We only offload VTL 0 today.
             assert_eq!(vtl, GuestVtl::Vtl0);
             tracing::info!("disabling APIC offload due to auto EOI");
-            let page = zerocopy::transmute_mut!(this.runner.tdx_apic_page_mut());
+            let page = this.runner.tdx_apic_page_mut(GuestVtl::Vtl0);
             let (irr, isr) = pull_apic_offload(page);
 
             this.backing.cvm.lapics[vtl]
@@ -902,86 +875,53 @@ impl BackingPrivate for TdxBacked {
     fn untrusted_synic_mut(&mut self) -> Option<&mut ProcessorSynic> {
         self.untrusted_synic.as_mut()
     }
+
+    fn handle_vp_start_enable_vtl_wake(
+        this: &mut UhProcessor<'_, Self>,
+        vtl: GuestVtl,
+    ) -> Result<(), UhRunVpError> {
+        this.hcvm_handle_vp_start_enable_vtl(vtl)
+    }
+
+    fn vtl1_inspectable(this: &UhProcessor<'_, Self>) -> bool {
+        this.hcvm_vtl1_inspectable()
+    }
 }
 
 impl UhProcessor<'_, TdxBacked> {
     /// Returns `Ok(false)` if the APIC offload needs to be disabled and the
     /// poll retried.
     fn try_poll_apic(&mut self, vtl: GuestVtl, scan_irr: bool) -> Result<bool, UhRunVpError> {
-        // Check for interrupt requests from the host and kernel IPI offload.
-        // TODO TDX GUEST VSM supporting VTL 1 proxy irrs requires kernel changes
-        if vtl == GuestVtl::Vtl0 {
-            if let Some(irr) = self.runner.proxy_irr() {
-                // We can't put the interrupts directly on the APIC page because we might need
-                // to clear the tmr state. This can happen if a vector was previously used for a level
-                // triggered interrupt, and is now being used for an edge-triggered interrupt.
-                self.backing.cvm.lapics[vtl]
-                    .lapic
-                    .request_fixed_interrupts(irr);
-            }
-        }
+        let mut scan = TdxApicScanner {
+            processor_controls: self.backing.vtls[vtl]
+                .processor_controls
+                .with_nmi_window_exiting(false)
+                .with_interrupt_window_exiting(false),
+            vp: self,
+            tpr_threshold: 0,
+        };
 
-        let ApicWork {
-            init,
-            extint,
-            sipi,
-            nmi,
-            interrupt,
-        } = self.backing.cvm.lapics[vtl]
-            .lapic
-            .scan(&mut self.vmtime, scan_irr);
+        // TODO TDX: filter proxy IRRs by setting the `proxy_irr_blocked` field of the run page
+        hardware_cvm::apic::poll_apic_core(&mut scan, vtl, scan_irr)?;
 
-        let mut new_processor_controls = self.backing.vtls[vtl]
-            .processor_controls
-            .with_nmi_window_exiting(false)
-            .with_interrupt_window_exiting(false);
-
-        // An INIT/SIPI targeted at a VP with more than one guest VTL enabled is ignored.
-        // Check VTL enablement inside each block to avoid taking a lock on the hot path,
-        // INIT and SIPI are quite cold.
-        if init {
-            if !*self.inner.hcvm_vtl1_enabled.lock() {
-                self.handle_init(vtl)?;
-            }
-        }
-
-        if let Some(vector) = sipi {
-            if !*self.inner.hcvm_vtl1_enabled.lock() {
-                self.handle_sipi(vtl, vector);
-            }
-        }
+        let TdxApicScanner {
+            vp: _,
+            processor_controls: new_processor_controls,
+            tpr_threshold: new_tpr_threshold,
+        } = scan;
 
         // Interrupts are ignored while waiting for SIPI.
-        if self.backing.cvm.lapics[vtl].activity != MpState::WaitForSipi {
-            self.backing.cvm.lapics[vtl].nmi_pending |= nmi;
-            if self.backing.cvm.lapics[vtl].nmi_pending {
-                self.handle_nmi(vtl, &mut new_processor_controls);
-            }
-
-            if extint {
-                tracelimit::warn_ratelimited!("extint not supported");
-            }
-
-            let mut new_tpr_threshold = 0;
-            if let Some(vector) = interrupt {
-                self.handle_interrupt(
-                    vector,
-                    vtl,
-                    &mut new_processor_controls,
-                    &mut new_tpr_threshold,
-                );
-            }
-
-            if self.backing.vtls[vtl].tpr_threshold != new_tpr_threshold {
-                tracing::trace!(new_tpr_threshold, ?vtl, "setting tpr threshold");
-                self.runner.write_vmcs32(
-                    vtl,
-                    VmcsField::VMX_VMCS_TPR_THRESHOLD,
-                    !0,
-                    new_tpr_threshold.into(),
-                );
-                self.backing.vtls[vtl].tpr_threshold = new_tpr_threshold;
-            }
+        if self.backing.cvm.lapics[vtl].activity != MpState::WaitForSipi
+            && self.backing.vtls[vtl].tpr_threshold != new_tpr_threshold
+        {
+            tracing::trace!(new_tpr_threshold, ?vtl, "setting tpr threshold");
+            self.runner.write_vmcs32(
+                vtl,
+                VmcsField::VMX_VMCS_TPR_THRESHOLD,
+                !0,
+                new_tpr_threshold.into(),
+            );
+            self.backing.vtls[vtl].tpr_threshold = new_tpr_threshold;
         }
 
         if self.backing.vtls[vtl].processor_controls != new_processor_controls {
@@ -1001,8 +941,7 @@ impl UhProcessor<'_, TdxBacked> {
             let r: Result<(), OffloadNotSupported> = self.backing.cvm.lapics[vtl]
                 .lapic
                 .push_to_offload(|irr, isr, tmr| {
-                    let apic_page: &mut ApicPage =
-                        zerocopy::transmute_mut!(self.runner.tdx_apic_page_mut());
+                    let apic_page = self.runner.tdx_apic_page_mut(GuestVtl::Vtl0);
 
                     for (((irr, page_irr), isr), page_isr) in irr
                         .iter()
@@ -1016,7 +955,7 @@ impl UhProcessor<'_, TdxBacked> {
 
                     // Update SVI and RVI.
                     let svi = top_vector(&apic_page.isr);
-                    self.runner.tdx_enter_guest_state_mut().svi = svi;
+                    self.backing.vtls[vtl].private_regs.svi = svi;
                     update_rvi = true;
 
                     // Ensure the EOI exit bitmap is up to date.
@@ -1040,8 +979,8 @@ impl UhProcessor<'_, TdxBacked> {
                             // must know if that interrupt was previously level-triggered. Otherwise,
                             // the EOI will be incorrectly treated as level-triggered. We keep a copy
                             // of the tmr in the kernel so it knows when this scenario occurs.
-                            self.runner.proxy_irr_exit_mut()[i * 2] = tmr as u32;
-                            self.runner.proxy_irr_exit_mut()[i * 2 + 1] = (tmr >> 32) as u32;
+                            self.runner.proxy_irr_exit_mut_vtl0()[i * 2] = tmr as u32;
+                            self.runner.proxy_irr_exit_mut_vtl0()[i * 2 + 1] = (tmr >> 32) as u32;
                         }
                     }
                 });
@@ -1053,16 +992,16 @@ impl UhProcessor<'_, TdxBacked> {
             }
 
             if update_rvi {
-                let page: &mut ApicPage = zerocopy::transmute_mut!(self.runner.tdx_apic_page_mut());
+                let page = self.runner.tdx_apic_page_mut(GuestVtl::Vtl0);
                 let rvi = top_vector(&page.irr);
-                self.runner.tdx_enter_guest_state_mut().rvi = rvi;
+                self.backing.vtls[vtl].private_regs.rvi = rvi;
             }
         }
 
         // If there is a pending interrupt, clear the halted and idle state.
         if (self.backing.cvm.lapics[vtl].activity != MpState::Running)
             && self.backing.cvm.lapics[vtl].lapic.is_offloaded()
-            && self.runner.tdx_enter_guest_state().rvi != 0
+            && self.backing.vtls[vtl].private_regs.rvi != 0
         {
             // To model a non-virtualized processor, we should only do this if
             // TPR and IF and interrupt shadow allow. However, fetching the
@@ -1089,8 +1028,8 @@ impl UhProcessor<'_, TdxBacked> {
     ) -> R {
         let offloaded = self.backing.cvm.lapics[vtl].lapic.is_offloaded();
         if offloaded {
-            let (irr, isr) =
-                pull_apic_offload(zerocopy::transmute_mut!(self.runner.tdx_apic_page_mut()));
+            assert_eq!(vtl, GuestVtl::Vtl0);
+            let (irr, isr) = pull_apic_offload(self.runner.tdx_apic_page_mut(GuestVtl::Vtl0));
             self.backing.cvm.lapics[vtl]
                 .lapic
                 .disable_offload(&irr, &isr);
@@ -1146,80 +1085,90 @@ impl UhProcessor<'_, TdxBacked> {
                 .set_valid(false);
         }
     }
+}
 
-    fn handle_interrupt(
-        &mut self,
-        vector: u8,
-        vtl: GuestVtl,
-        processor_controls: &mut ProcessorControls,
-        tpr_threshold: &mut u8,
-    ) {
+struct TdxApicScanner<'a, 'b> {
+    vp: &'a mut UhProcessor<'b, TdxBacked>,
+    processor_controls: ProcessorControls,
+    tpr_threshold: u8,
+}
+
+impl<'b> hardware_cvm::apic::ApicBacking<'b, TdxBacked> for TdxApicScanner<'_, 'b> {
+    fn vp(&mut self) -> &mut UhProcessor<'b, TdxBacked> {
+        self.vp
+    }
+
+    fn handle_interrupt(&mut self, vtl: GuestVtl, vector: u8) -> Result<(), UhRunVpError> {
         // Exit idle when an interrupt is received, regardless of IF
-        if self.backing.cvm.lapics[vtl].activity == MpState::Idle {
-            self.backing.cvm.lapics[vtl].activity = MpState::Running;
+        if self.vp.backing.cvm.lapics[vtl].activity == MpState::Idle {
+            self.vp.backing.cvm.lapics[vtl].activity = MpState::Running;
         }
         // If there is a higher-priority pending event of some kind, then
         // just request an exit after it has resolved, after which we will
         // try again.
-        if self.backing.vtls[vtl].interruption_information.valid()
-            && self.backing.vtls[vtl]
+        if self.vp.backing.vtls[vtl].interruption_information.valid()
+            && self.vp.backing.vtls[vtl]
                 .interruption_information
                 .interruption_type()
                 != INTERRUPT_TYPE_EXTERNAL
         {
-            processor_controls.set_interrupt_window_exiting(true);
-            return;
+            self.processor_controls.set_interrupt_window_exiting(true);
+            return Ok(());
         }
 
         // Ensure the interrupt is not blocked by RFLAGS.IF or interrupt shadow.
         let interruptibility: Interruptibility = self
+            .vp
             .runner
             .read_vmcs32(vtl, VmcsField::VMX_VMCS_GUEST_INTERRUPTIBILITY)
             .into();
 
-        let rflags = RFlags::from(self.runner.tdx_enter_guest_state().rflags);
+        let rflags = RFlags::from(self.vp.backing.vtls[vtl].private_regs.rflags);
         if !rflags.interrupt_enable()
             || interruptibility.blocked_by_sti()
             || interruptibility.blocked_by_movss()
         {
-            processor_controls.set_interrupt_window_exiting(true);
-            return;
+            self.processor_controls.set_interrupt_window_exiting(true);
+            return Ok(());
         }
 
         let priority = vector >> 4;
-        let apic: &ApicPage = zerocopy::transmute_ref!(self.runner.tdx_apic_page());
+        let apic = self.vp.runner.tdx_apic_page(vtl);
         if (apic.tpr.value as u8 >> 4) >= priority {
-            *tpr_threshold = priority;
-            return;
+            self.tpr_threshold = priority;
+            return Ok(());
         }
 
-        self.backing.vtls[vtl].interruption_information = InterruptionInformation::new()
+        self.vp.backing.vtls[vtl].interruption_information = InterruptionInformation::new()
             .with_valid(true)
             .with_vector(vector)
             .with_interruption_type(INTERRUPT_TYPE_EXTERNAL);
 
-        self.backing.cvm.lapics[vtl].activity = MpState::Running;
+        self.vp.backing.cvm.lapics[vtl].activity = MpState::Running;
+        Ok(())
     }
 
-    fn handle_nmi(&mut self, vtl: GuestVtl, processor_controls: &mut ProcessorControls) {
+    fn handle_nmi(&mut self, vtl: GuestVtl) -> Result<(), UhRunVpError> {
         // Exit idle when an interrupt is received, regardless of IF
-        if self.backing.cvm.lapics[vtl].activity == MpState::Idle {
-            self.backing.cvm.lapics[vtl].activity = MpState::Running;
+        // TODO: Investigate lifting more activity management into poll_apic_core
+        if self.vp.backing.cvm.lapics[vtl].activity == MpState::Idle {
+            self.vp.backing.cvm.lapics[vtl].activity = MpState::Running;
         }
         // If there is a higher-priority pending event of some kind, then
         // just request an exit after it has resolved, after which we will
         // try again.
-        if self.backing.vtls[vtl].interruption_information.valid()
-            && self.backing.vtls[vtl]
+        if self.vp.backing.vtls[vtl].interruption_information.valid()
+            && self.vp.backing.vtls[vtl]
                 .interruption_information
                 .interruption_type()
                 != INTERRUPT_TYPE_EXTERNAL
         {
-            processor_controls.set_nmi_window_exiting(true);
-            return;
+            self.processor_controls.set_nmi_window_exiting(true);
+            return Ok(());
         }
 
         let interruptibility: Interruptibility = self
+            .vp
             .runner
             .read_vmcs32(vtl, VmcsField::VMX_VMCS_GUEST_INTERRUPTIBILITY)
             .into();
@@ -1228,46 +1177,29 @@ impl UhProcessor<'_, TdxBacked> {
             || interruptibility.blocked_by_sti()
             || interruptibility.blocked_by_movss()
         {
-            processor_controls.set_nmi_window_exiting(true);
-            return;
+            self.processor_controls.set_nmi_window_exiting(true);
+            return Ok(());
         }
 
-        self.backing.vtls[vtl].interruption_information = InterruptionInformation::new()
+        self.vp.backing.vtls[vtl].interruption_information = InterruptionInformation::new()
             .with_valid(true)
             .with_vector(2)
             .with_interruption_type(INTERRUPT_TYPE_NMI);
 
-        self.backing.cvm.lapics[vtl].activity = MpState::Running;
-    }
-
-    fn handle_init(&mut self, vtl: GuestVtl) -> Result<(), UhRunVpError> {
-        let vp_info = self.inner.vp_info;
-        {
-            let mut access = self.access_state(vtl.into());
-            vp::x86_init(&mut access, &vp_info).map_err(UhRunVpError::State)?;
-        }
+        self.vp.backing.cvm.lapics[vtl].activity = MpState::Running;
         Ok(())
     }
 
-    fn handle_sipi(&mut self, vtl: GuestVtl, vector: u8) {
-        if self.backing.cvm.lapics[vtl].activity == MpState::WaitForSipi {
-            let address = (vector as u64) << 12;
-            self.write_segment(
-                vtl,
-                TdxSegmentReg::Cs,
-                SegmentRegister {
-                    base: address,
-                    limit: 0xffff,
-                    selector: (address >> 4) as u16,
-                    attributes: 0x9b,
-                },
-            )
-            .unwrap();
-            self.runner.tdx_enter_guest_state_mut().rip = 0;
-            self.backing.cvm.lapics[vtl].activity = MpState::Running;
-        }
-    }
+    fn handle_sipi(&mut self, vtl: GuestVtl, cs: SegmentRegister) -> Result<(), UhRunVpError> {
+        self.vp.write_segment(vtl, TdxSegmentReg::Cs, cs).unwrap();
+        self.vp.backing.vtls[vtl].private_regs.rip = 0;
+        self.vp.backing.cvm.lapics[vtl].activity = MpState::Running;
 
+        Ok(())
+    }
+}
+
+impl UhProcessor<'_, TdxBacked> {
     async fn run_vp_tdx(&mut self, dev: &impl CpuIo) -> Result<(), VpHaltReason<UhRunVpError>> {
         let next_vtl = self.backing.cvm.exit_vtl;
 
@@ -1305,8 +1237,22 @@ impl UhProcessor<'_, TdxBacked> {
             self.backing.vtls[next_vtl].interruption_set = false;
         }
 
-        // We're about to return to a lower VTL, so do any pending flushes, unlock our
-        // TLB locks, and wait for any others we're supposed to.
+        // We're about to return to a lower VTL, so set active_vtl for other VPs,
+        // do any pending flushes, unlock our TLB locks, and wait for any others
+        // we're supposed to.
+
+        // active_vtl needs SeqCst ordering here in order to correctly synchronize
+        // access with the TLB address flush list. We need to ensure that, when
+        // other VPs are adding entries to the list, they always observe the
+        // correct lower active VTL. Otherwise they might choose to not send this
+        // VP a wake, leading to a stall, until this VP happens to exit to VTL 2 again.
+        //
+        // This does technically leave open a small window for potential spurious
+        // wakes, but that's preferable, and will cause no problems besides a
+        // small amount of time waste.
+        self.shared.active_vtl[self.vp_index().index() as usize]
+            .store(next_vtl as u8, Ordering::SeqCst);
+
         self.do_tlb_flush(next_vtl);
         self.unlock_tlb_lock(Vtl::Vtl2);
         let tlb_halt = self.should_halt_for_tlb_unlock(next_vtl);
@@ -1340,16 +1286,26 @@ impl UhProcessor<'_, TdxBacked> {
         *self.runner.offload_flags_mut() = offload_flags;
 
         self.runner
-            .tdx_vp_entry_flags_mut()
-            .set_vm_index(next_vtl as u8 + 1);
+            .write_private_regs(&self.backing.vtls[next_vtl].private_regs);
 
         let has_intercept = self
             .runner
             .run()
             .map_err(|e| VpHaltReason::Hypervisor(UhRunVpError::Run(e)))?;
 
+        // TLB flushes can only target lower VTLs, so it is fine to use a relaxed
+        // ordering here. The worst that can happen is some spurious wakes, due
+        // to another VP observing that this VP is still in a lower VTL.
+        self.shared.active_vtl[self.vp_index().index() as usize].store(2, Ordering::Relaxed);
+
         let entered_from_vtl = next_vtl;
-        *self.runner.tdx_vp_entry_flags_mut() = TdxVmFlags::new();
+        self.runner
+            .read_private_regs(&mut self.backing.vtls[entered_from_vtl].private_regs);
+        // TODO: Remove this line once the kernel does it for us
+        self.backing.vtls[entered_from_vtl]
+            .private_regs
+            .vp_entry_flags
+            .set_invd_translations(0);
 
         // Kernel offload may have set or cleared the halt/idle states
         if offload_enabled && kernel_known_state {
@@ -1545,7 +1501,7 @@ impl UhProcessor<'_, TdxBacked> {
                         ),
                     };
 
-                    let mut rax = self.runner.tdx_enter_guest_state().rax();
+                    let mut rax = self.runner.tdx_enter_guest_gps()[TdxGp::RAX];
                     emulate_io(
                         self.inner.vp_info.base.vp_index,
                         !io_qual.is_in(),
@@ -1555,22 +1511,21 @@ impl UhProcessor<'_, TdxBacked> {
                         dev,
                     )
                     .await;
-                    self.runner.tdx_enter_guest_state_mut().set_rax(rax);
+                    self.runner.tdx_enter_guest_gps_mut()[TdxGp::RAX] = rax;
 
-                    self.advance_to_next_instruction();
+                    self.advance_to_next_instruction(intercepted_vtl);
                 }
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.io
             }
             VmxExit::MSR_READ => {
-                let enter_state = self.runner.tdx_enter_guest_state();
-                let msr = enter_state.rcx() as u32;
+                let msr = self.runner.tdx_enter_guest_gps()[TdxGp::RCX] as u32;
 
                 let result = self.backing.cvm.lapics[intercepted_vtl]
                     .lapic
                     .access(&mut TdxApicClient {
                         partition: self.partition,
                         vmtime: &self.vmtime,
-                        apic_page: zerocopy::transmute_mut!(self.runner.tdx_apic_page_mut()),
+                        apic_page: self.runner.tdx_apic_page_mut(intercepted_vtl),
                         dev,
                         vtl: intercepted_vtl,
                     })
@@ -1590,16 +1545,16 @@ impl UhProcessor<'_, TdxBacked> {
                 let value = match result {
                     Ok(v) => Some(v),
                     Err(MsrError::Unknown) => {
-                        tracelimit::error_ratelimited!(msr, "unknown tdx cvm msr read");
+                        tracelimit::warn_ratelimited!(msr, "unknown tdx vm msr read");
                         Some(0)
                     }
                     Err(MsrError::InvalidAccess) => None,
                 };
 
                 let inject_gp = if let Some(value) = value {
-                    let enter_state = self.runner.tdx_enter_guest_state_mut();
-                    enter_state.set_rax((value as u32).into());
-                    enter_state.set_rdx(((value >> 32) as u32).into());
+                    let gps = self.runner.tdx_enter_guest_gps_mut();
+                    gps[TdxGp::RAX] = (value as u32).into();
+                    gps[TdxGp::RDX] = ((value >> 32) as u32).into();
                     false
                 } else {
                     true
@@ -1608,33 +1563,34 @@ impl UhProcessor<'_, TdxBacked> {
                 if inject_gp {
                     self.inject_gpf(intercepted_vtl);
                 } else {
-                    self.advance_to_next_instruction();
+                    self.advance_to_next_instruction(intercepted_vtl);
                 }
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.msr_read
             }
             VmxExit::MSR_WRITE => {
-                let enter_state = self.runner.tdx_enter_guest_state();
-                let msr = enter_state.rcx() as u32;
+                let gps = self.runner.tdx_enter_guest_gps();
+                let msr = gps[TdxGp::RCX] as u32;
                 let value =
-                    (enter_state.rax() as u32 as u64) | ((enter_state.rdx() as u32 as u64) << 32);
+                    (gps[TdxGp::RAX] as u32 as u64) | ((gps[TdxGp::RDX] as u32 as u64) << 32);
 
                 let result = self.backing.cvm.lapics[intercepted_vtl]
                     .lapic
                     .access(&mut TdxApicClient {
                         partition: self.partition,
                         vmtime: &self.vmtime,
-                        apic_page: zerocopy::transmute_mut!(self.runner.tdx_apic_page_mut()),
+                        apic_page: self.runner.tdx_apic_page_mut(intercepted_vtl),
                         dev,
                         vtl: intercepted_vtl,
                     })
                     .msr_write(msr, value)
+                    .or_else_if_unknown(|| self.write_msr_cvm(msr, value, intercepted_vtl))
                     .or_else_if_unknown(|| self.write_msr(msr, value, intercepted_vtl))
-                    .or_else_if_unknown(|| self.write_msr_cvm(msr, value, intercepted_vtl));
+                    .or_else_if_unknown(|| self.write_msr_tdx(msr, value, intercepted_vtl));
 
                 let inject_gp = match result {
                     Ok(()) => false,
                     Err(MsrError::Unknown) => {
-                        tracelimit::error_ratelimited!(msr, value, "unknown tdx cvm msr write");
+                        tracelimit::warn_ratelimited!(msr, value, "unknown tdx vm msr write");
                         false
                     }
                     Err(MsrError::InvalidAccess) => true,
@@ -1643,15 +1599,15 @@ impl UhProcessor<'_, TdxBacked> {
                 if inject_gp {
                     self.inject_gpf(intercepted_vtl);
                 } else {
-                    self.advance_to_next_instruction();
+                    self.advance_to_next_instruction(intercepted_vtl);
                 }
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.msr_write
             }
             VmxExit::CPUID => {
-                let xss = self.runner.tdx_vp_state().msr_xss;
-                let enter_state = self.runner.tdx_enter_guest_state();
-                let leaf = enter_state.rax() as u32;
-                let subleaf = enter_state.rcx() as u32;
+                let xss = self.backing.vtls[intercepted_vtl].private_regs.msr_xss;
+                let gps = self.runner.tdx_enter_guest_gps();
+                let leaf = gps[TdxGp::RAX] as u32;
+                let subleaf = gps[TdxGp::RCX] as u32;
                 let xfem = self
                     .runner
                     .get_vp_register(intercepted_vtl, HvX64RegisterName::Xfem)
@@ -1676,13 +1632,13 @@ impl UhProcessor<'_, TdxBacked> {
                     &[result.eax, result.ebx, result.ecx, result.edx],
                 );
 
-                let enter_state = self.runner.tdx_enter_guest_state_mut();
-                enter_state.set_rax(eax.into());
-                enter_state.set_rbx(ebx.into());
-                enter_state.set_rcx(ecx.into());
-                enter_state.set_rdx(edx.into());
+                let gps = self.runner.tdx_enter_guest_gps_mut();
+                gps[TdxGp::RAX] = eax.into();
+                gps[TdxGp::RBX] = ebx.into();
+                gps[TdxGp::RCX] = ecx.into();
+                gps[TdxGp::RDX] = edx.into();
 
-                self.advance_to_next_instruction();
+                self.advance_to_next_instruction(intercepted_vtl);
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.cpuid
             }
             VmxExit::VMCALL_INSTRUCTION => {
@@ -1710,12 +1666,8 @@ impl UhProcessor<'_, TdxBacked> {
             }
             VmxExit::HLT_INSTRUCTION => {
                 self.backing.cvm.lapics[intercepted_vtl].activity = MpState::Halted;
-
-                // TODO TDX: see lots of these exits while waiting at frontpage.
-                // Probably expected, given we will still get L1 timer
-                // interrupts?
                 self.clear_interrupt_shadow(intercepted_vtl);
-                self.advance_to_next_instruction();
+                self.advance_to_next_instruction(intercepted_vtl);
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.hlt
             }
             VmxExit::CR_ACCESS => {
@@ -1725,8 +1677,7 @@ impl UhProcessor<'_, TdxBacked> {
                 match qual.access_type() {
                     CR_ACCESS_TYPE_MOV_TO_CR => {
                         cr = qual.cr();
-                        value =
-                            self.runner.tdx_enter_guest_state().gps[qual.gp_register() as usize];
+                        value = self.runner.tdx_enter_guest_gps()[qual.gp_register() as usize];
                     }
                     CR_ACCESS_TYPE_LMSW => {
                         cr = 0;
@@ -1747,7 +1698,7 @@ impl UhProcessor<'_, TdxBacked> {
                 };
                 if r.is_ok() {
                     self.update_execution_mode(intercepted_vtl).expect("BUGBUG");
-                    self.advance_to_next_instruction();
+                    self.advance_to_next_instruction(intercepted_vtl);
                 } else {
                     tracelimit::warn_ratelimited!(cr, value, "failed to write cr");
                     self.inject_gpf(intercepted_vtl);
@@ -1755,12 +1706,12 @@ impl UhProcessor<'_, TdxBacked> {
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.cr_access
             }
             VmxExit::XSETBV => {
-                let enter_state = self.runner.tdx_enter_guest_state();
+                let gps = self.runner.tdx_enter_guest_gps();
                 if let Some(value) =
                     hardware_cvm::validate_xsetbv_exit(hardware_cvm::XsetbvExitInput {
-                        rax: enter_state.rax(),
-                        rcx: enter_state.rcx(),
-                        rdx: enter_state.rdx(),
+                        rax: gps[TdxGp::RAX],
+                        rcx: gps[TdxGp::RCX],
+                        rdx: gps[TdxGp::RDX],
                         cr4: self.backing.vtls[intercepted_vtl].cr4.read(&self.runner),
                         cpl: exit_info.cpl(),
                     })
@@ -1770,7 +1721,7 @@ impl UhProcessor<'_, TdxBacked> {
                         .map_err(|err| {
                             VpHaltReason::Hypervisor(UhRunVpError::EmulationState(err))
                         })?;
-                    self.advance_to_next_instruction();
+                    self.advance_to_next_instruction(intercepted_vtl);
                 } else {
                     self.inject_gpf(intercepted_vtl);
                 }
@@ -1780,12 +1731,12 @@ impl UhProcessor<'_, TdxBacked> {
                 // Ask the kernel to flush the cache before issuing VP.ENTER.
                 let no_invalidate = exit_info.qualification() != 0;
                 if no_invalidate {
-                    self.runner.tdx_vp_state_mut().flags.set_wbnoinvd(true);
+                    self.runner.tdx_vp_state_flags_mut().set_wbnoinvd(true);
                 } else {
-                    self.runner.tdx_vp_state_mut().flags.set_wbinvd(true);
+                    self.runner.tdx_vp_state_flags_mut().set_wbinvd(true);
                 }
 
-                self.advance_to_next_instruction();
+                self.advance_to_next_instruction(intercepted_vtl);
                 &mut self.backing.vtls[intercepted_vtl].exit_stats.wbinvd
             }
             VmxExit::EPT_VIOLATION => {
@@ -1921,9 +1872,9 @@ impl UhProcessor<'_, TdxBacked> {
         Ok(())
     }
 
-    fn advance_to_next_instruction(&mut self) {
+    fn advance_to_next_instruction(&mut self, vtl: GuestVtl) {
         let instr_info = TdxExit(self.runner.tdx_vp_enter_exit_info()).instr_info();
-        let rip = &mut self.runner.tdx_enter_guest_state_mut().rip;
+        let rip = &mut self.backing.vtls[vtl].private_regs.rip;
         *rip = rip.wrapping_add(instr_info.length().into());
     }
 
@@ -1948,13 +1899,13 @@ impl UhProcessor<'_, TdxBacked> {
     }
 
     fn handle_tdvmcall(&mut self, dev: &impl CpuIo, intercepted_vtl: GuestVtl) {
-        let regs = self.runner.tdx_enter_guest_state();
-        if regs.r10() == 0 {
+        let regs = self.runner.tdx_enter_guest_gps();
+        if regs[TdxGp::R10] == 0 {
             // Architectural VMCALL.
-            let result = match VmxExit(regs.r11() as u32) {
+            let result = match VmxExit(regs[TdxGp::R11] as u32) {
                 VmxExit::MSR_WRITE => {
-                    let msr = regs.r12() as u32;
-                    let value = regs.r13();
+                    let msr = regs[TdxGp::R12] as u32;
+                    let value = regs[TdxGp::R13];
                     match self.write_tdvmcall_msr(msr, value, intercepted_vtl) {
                         Ok(()) => {
                             tracing::debug!(msr, value, "tdvmcall msr write");
@@ -1972,11 +1923,11 @@ impl UhProcessor<'_, TdxBacked> {
                     }
                 }
                 VmxExit::MSR_READ => {
-                    let msr = regs.r12() as u32;
+                    let msr = regs[TdxGp::R12] as u32;
                     match self.read_tdvmcall_msr(msr, intercepted_vtl) {
                         Ok(value) => {
                             tracing::debug!(msr, value, "tdvmcall msr read");
-                            self.runner.tdx_enter_guest_state_mut().set_r11(value);
+                            self.runner.tdx_enter_guest_gps_mut()[TdxGp::R11] = value;
                             TdVmCallR10Result::SUCCESS
                         }
                         Err(err) => {
@@ -1993,9 +1944,12 @@ impl UhProcessor<'_, TdxBacked> {
                     TdVmCallR10Result::OPERAND_INVALID
                 }
             };
-            let regs = self.runner.tdx_enter_guest_state_mut();
-            regs.set_r10(result.0);
-            regs.rip = regs.rip.wrapping_add(4);
+            self.runner.tdx_enter_guest_gps_mut()[TdxGp::R10] = result.0;
+            self.backing.vtls[intercepted_vtl].private_regs.rip = self.backing.vtls
+                [intercepted_vtl]
+                .private_regs
+                .rip
+                .wrapping_add(4);
         } else {
             // This hypercall is normally handled by the hypervisor, so the gpas
             // given by the guest should all be shared. The hypervisor allows
@@ -2036,8 +1990,8 @@ impl UhProcessor<'_, TdxBacked> {
         intercepted_vtl: GuestVtl,
     ) -> Result<(), MsrError> {
         match msr {
-            msr @ hvdef::HV_X64_MSR_GUEST_OS_ID => {
-                self.backing.cvm.hv[intercepted_vtl].msr_write(msr, value)?
+            hvdef::HV_X64_MSR_GUEST_OS_ID => {
+                self.backing.cvm.hv[intercepted_vtl].msr_write_guest_os_id(value)
             }
             _ => {
                 // If we get here we must have an untrusted synic, as otherwise
@@ -2109,7 +2063,7 @@ impl UhProcessor<'_, TdxBacked> {
             x86defs::X86X_MSR_MCG_CAP => Ok(0),
             x86defs::X86X_MSR_MCG_STATUS => Ok(0),
             x86defs::X86X_MSR_MC_UPDATE_PATCH_LEVEL => Ok(0xFFFFFFFF),
-            x86defs::X86X_MSR_XSS => Ok(self.runner.tdx_vp_state().msr_xss),
+            x86defs::X86X_MSR_XSS => Ok(self.backing.vtls[vtl].private_regs.msr_xss),
             x86defs::X86X_IA32_MSR_MISC_ENABLE => Ok(hv1_emulator::x86::MISC_ENABLE.into()),
             x86defs::X86X_IA32_MSR_FEATURE_CONTROL => Ok(VMX_FEATURE_CONTROL_LOCKED),
             x86defs::X86X_MSR_CR_PAT => {
@@ -2134,8 +2088,8 @@ impl UhProcessor<'_, TdxBacked> {
         }
     }
 
-    fn write_msr_cvm(&mut self, msr: u32, value: u64, vtl: GuestVtl) -> Result<(), MsrError> {
-        let state = self.runner.tdx_vp_state_mut();
+    fn write_msr_tdx(&mut self, msr: u32, value: u64, vtl: GuestVtl) -> Result<(), MsrError> {
+        let state = &mut self.backing.vtls[vtl].private_regs;
 
         match msr {
             X86X_MSR_EFER => {
@@ -2235,8 +2189,6 @@ impl UhProcessor<'_, TdxBacked> {
         self.runner
             .write_vmcs32(vtl, seg.attributes(), !0, attributes.into());
 
-        // TODO TDX: cache CS into last exit because last exit contains CS optionally?
-
         Ok(())
     }
 
@@ -2272,13 +2224,11 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
     }
 
     fn gp(&mut self, reg: Gp) -> u64 {
-        let enter_state = self.vp.runner.tdx_enter_guest_state();
-        enter_state.gps[reg as usize]
+        self.vp.runner.tdx_enter_guest_gps()[reg as usize]
     }
 
     fn set_gp(&mut self, reg: Gp, v: u64) {
-        let enter_state = self.vp.runner.tdx_enter_guest_state_mut();
-        enter_state.gps[reg as usize] = v;
+        self.vp.runner.tdx_enter_guest_gps_mut()[reg as usize] = v;
     }
 
     fn xmm(&mut self, index: usize) -> u128 {
@@ -2291,13 +2241,11 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
     }
 
     fn rip(&mut self) -> u64 {
-        let enter_state = self.vp.runner.tdx_enter_guest_state();
-        enter_state.rip
+        self.vp.backing.vtls[self.vtl].private_regs.rip
     }
 
     fn set_rip(&mut self, v: u64) {
-        let enter_state = self.vp.runner.tdx_enter_guest_state_mut();
-        enter_state.rip = v;
+        self.vp.backing.vtls[self.vtl].private_regs.rip = v;
     }
 
     fn segment(&mut self, index: Segment) -> x86defs::SegmentRegister {
@@ -2331,13 +2279,11 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
     }
 
     fn rflags(&mut self) -> RFlags {
-        let enter_state = self.vp.runner.tdx_enter_guest_state();
-        enter_state.rflags.into()
+        self.vp.backing.vtls[self.vtl].private_regs.rflags.into()
     }
 
     fn set_rflags(&mut self, v: RFlags) {
-        let enter_state = self.vp.runner.tdx_enter_guest_state_mut();
-        enter_state.rflags = v.into();
+        self.vp.backing.vtls[self.vtl].private_regs.rflags = v.into();
     }
 
     fn instruction_bytes(&self) -> &[u8] {
@@ -2444,7 +2390,7 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
                 partition: self.vp.partition,
                 dev: self.devices,
                 vmtime: &self.vp.vmtime,
-                apic_page: zerocopy::transmute_mut!(self.vp.runner.tdx_apic_page_mut()),
+                apic_page: self.vp.runner.tdx_apic_page_mut(self.vtl),
                 vtl: self.vtl,
             })
             .mmio_read(address, data);
@@ -2457,7 +2403,7 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, TdxBacked> {
                 partition: self.vp.partition,
                 dev: self.devices,
                 vmtime: &self.vp.vmtime,
-                apic_page: zerocopy::transmute_mut!(self.vp.runner.tdx_apic_page_mut()),
+                apic_page: self.vp.runner.tdx_apic_page_mut(self.vtl),
                 vtl: self.vtl,
             })
             .mmio_write(address, data);
@@ -2693,6 +2639,7 @@ impl<T: CpuIo> ApicClient for TdxApicClient<'_, T> {
     }
 
     fn pull_offload(&mut self) -> ([u32; 8], [u32; 8]) {
+        assert_eq!(self.vtl, GuestVtl::Vtl0);
         pull_apic_offload(self.apic_page)
     }
 }
@@ -2714,36 +2661,36 @@ fn pull_apic_offload(page: &mut ApicPage) -> ([u32; 8], [u32; 8]) {
 
 impl<T> hv1_hypercall::X64RegisterState for UhHypercallHandler<'_, '_, T, TdxBacked> {
     fn rip(&mut self) -> u64 {
-        self.vp.runner.tdx_enter_guest_state().rip
+        self.vp.backing.vtls[self.intercepted_vtl].private_regs.rip
     }
 
     fn set_rip(&mut self, rip: u64) {
-        self.vp.runner.tdx_enter_guest_state_mut().rip = rip;
+        self.vp.backing.vtls[self.intercepted_vtl].private_regs.rip = rip;
     }
 
     fn gp(&mut self, n: hv1_hypercall::X64HypercallRegister) -> u64 {
-        let enter_state = self.vp.runner.tdx_enter_guest_state();
+        let gps = self.vp.runner.tdx_enter_guest_gps();
         match n {
-            hv1_hypercall::X64HypercallRegister::Rax => enter_state.rax(),
-            hv1_hypercall::X64HypercallRegister::Rcx => enter_state.rcx(),
-            hv1_hypercall::X64HypercallRegister::Rdx => enter_state.rdx(),
-            hv1_hypercall::X64HypercallRegister::Rbx => enter_state.rbx(),
-            hv1_hypercall::X64HypercallRegister::Rsi => enter_state.rsi(),
-            hv1_hypercall::X64HypercallRegister::Rdi => enter_state.rdi(),
-            hv1_hypercall::X64HypercallRegister::R8 => enter_state.r8(),
+            hv1_hypercall::X64HypercallRegister::Rax => gps[TdxGp::RAX],
+            hv1_hypercall::X64HypercallRegister::Rcx => gps[TdxGp::RCX],
+            hv1_hypercall::X64HypercallRegister::Rdx => gps[TdxGp::RDX],
+            hv1_hypercall::X64HypercallRegister::Rbx => gps[TdxGp::RBX],
+            hv1_hypercall::X64HypercallRegister::Rsi => gps[TdxGp::RSI],
+            hv1_hypercall::X64HypercallRegister::Rdi => gps[TdxGp::RDI],
+            hv1_hypercall::X64HypercallRegister::R8 => gps[TdxGp::R8],
         }
     }
 
     fn set_gp(&mut self, n: hv1_hypercall::X64HypercallRegister, value: u64) {
-        let enter_state = self.vp.runner.tdx_enter_guest_state_mut();
+        let gps = self.vp.runner.tdx_enter_guest_gps_mut();
         match n {
-            hv1_hypercall::X64HypercallRegister::Rax => enter_state.set_rax(value),
-            hv1_hypercall::X64HypercallRegister::Rcx => enter_state.set_rcx(value),
-            hv1_hypercall::X64HypercallRegister::Rdx => enter_state.set_rdx(value),
-            hv1_hypercall::X64HypercallRegister::Rbx => enter_state.set_rbx(value),
-            hv1_hypercall::X64HypercallRegister::Rsi => enter_state.set_rsi(value),
-            hv1_hypercall::X64HypercallRegister::Rdi => enter_state.set_rdi(value),
-            hv1_hypercall::X64HypercallRegister::R8 => enter_state.set_r8(value),
+            hv1_hypercall::X64HypercallRegister::Rax => gps[TdxGp::RAX] = value,
+            hv1_hypercall::X64HypercallRegister::Rcx => gps[TdxGp::RCX] = value,
+            hv1_hypercall::X64HypercallRegister::Rdx => gps[TdxGp::RDX] = value,
+            hv1_hypercall::X64HypercallRegister::Rbx => gps[TdxGp::RBX] = value,
+            hv1_hypercall::X64HypercallRegister::Rsi => gps[TdxGp::RSI] = value,
+            hv1_hypercall::X64HypercallRegister::Rdi => gps[TdxGp::RDI] = value,
+            hv1_hypercall::X64HypercallRegister::R8 => gps[TdxGp::R8] = value,
         }
     }
 
@@ -2774,14 +2721,14 @@ impl<T: CpuIo> UhHypercallHandler<'_, '_, T, TdxBacked> {
             hv1_hypercall::HvSignalEvent,
             hv1_hypercall::HvExtQueryCapabilities,
             // TODO TDX: copied from SNP, enable individually as needed.
-            // hv1_hypercall::HvGetVpRegisters,
-            // hv1_hypercall::HvSetVpRegisters,
+            hv1_hypercall::HvGetVpRegisters,
+            hv1_hypercall::HvSetVpRegisters,
             // hv1_hypercall::HvEnablePartitionVtl,
             // hv1_hypercall::HvX64EnableVpVtl,
             // hv1_hypercall::HvVtlCall,
             // hv1_hypercall::HvVtlReturn,
-            // hv1_hypercall::HvModifyVtlProtectionMask,
-            // hv1_hypercall::HvX64TranslateVirtualAddress,
+            hv1_hypercall::HvModifyVtlProtectionMask,
+            hv1_hypercall::HvX64TranslateVirtualAddress,
         ]
     );
 
@@ -2806,7 +2753,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
     }
 
     fn registers(&mut self) -> Result<Registers, Self::Error> {
-        let enter_state = self.vp.runner.tdx_enter_guest_state();
+        let gps = self.vp.runner.tdx_enter_guest_gps();
 
         tracing::trace!("not getting cr8, must read from apic page or apic tpr");
         let cr8 = 0;
@@ -2824,7 +2771,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
         let idtr = self.vp.read_table_register(self.vtl, TdxTableReg::Idtr);
 
         let cr0 = self.vp.read_cr0(self.vtl);
-        let cr2 = self.vp.runner.tdx_vp_state().cr2;
+        let cr2 = self.vp.runner.cr2();
         let cr3 = self
             .vp
             .runner
@@ -2834,24 +2781,24 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
         let efer = self.vp.backing.vtls[self.vtl].efer;
 
         Ok(Registers {
-            rax: enter_state.rax(),
-            rcx: enter_state.rcx(),
-            rdx: enter_state.rdx(),
-            rbx: enter_state.rbx(),
-            rsp: enter_state.rsp(),
-            rbp: enter_state.rbp(),
-            rsi: enter_state.rsi(),
-            rdi: enter_state.rdi(),
-            r8: enter_state.r8(),
-            r9: enter_state.r9(),
-            r10: enter_state.r10(),
-            r11: enter_state.r11(),
-            r12: enter_state.r12(),
-            r13: enter_state.r13(),
-            r14: enter_state.r14(),
-            r15: enter_state.r15(),
-            rip: enter_state.rip,
-            rflags: enter_state.rflags,
+            rax: gps[TdxGp::RAX],
+            rcx: gps[TdxGp::RCX],
+            rdx: gps[TdxGp::RDX],
+            rbx: gps[TdxGp::RBX],
+            rsp: gps[TdxGp::RSP],
+            rbp: gps[TdxGp::RBP],
+            rsi: gps[TdxGp::RSI],
+            rdi: gps[TdxGp::RDI],
+            r8: gps[TdxGp::R8],
+            r9: gps[TdxGp::R9],
+            r10: gps[TdxGp::R10],
+            r11: gps[TdxGp::R11],
+            r12: gps[TdxGp::R12],
+            r13: gps[TdxGp::R13],
+            r14: gps[TdxGp::R14],
+            r15: gps[TdxGp::R15],
+            rip: self.vp.backing.vtls[self.vtl].private_regs.rip,
+            rflags: self.vp.backing.vtls[self.vtl].private_regs.rflags,
             cs,
             ds,
             es,
@@ -2909,26 +2856,26 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
             efer,
         } = value;
 
-        let enter_state = self.vp.runner.tdx_enter_guest_state_mut();
-        enter_state.set_rax(*rax);
-        enter_state.set_rcx(*rcx);
-        enter_state.set_rdx(*rdx);
-        enter_state.set_rbx(*rbx);
-        enter_state.set_rsp(*rsp);
-        enter_state.set_rbp(*rbp);
-        enter_state.set_rsi(*rsi);
-        enter_state.set_rdi(*rdi);
-        enter_state.set_r8(*r8);
-        enter_state.set_r9(*r9);
-        enter_state.set_r10(*r10);
-        enter_state.set_r11(*r11);
-        enter_state.set_r12(*r12);
-        enter_state.set_r13(*r13);
-        enter_state.set_r14(*r14);
-        enter_state.set_r15(*r15);
-        enter_state.rip = *rip;
+        let gps = self.vp.runner.tdx_enter_guest_gps_mut();
+        gps[TdxGp::RAX] = *rax;
+        gps[TdxGp::RCX] = *rcx;
+        gps[TdxGp::RDX] = *rdx;
+        gps[TdxGp::RBX] = *rbx;
+        gps[TdxGp::RSP] = *rsp;
+        gps[TdxGp::RBP] = *rbp;
+        gps[TdxGp::RSI] = *rsi;
+        gps[TdxGp::RDI] = *rdi;
+        gps[TdxGp::R8] = *r8;
+        gps[TdxGp::R9] = *r9;
+        gps[TdxGp::R10] = *r10;
+        gps[TdxGp::R11] = *r11;
+        gps[TdxGp::R12] = *r12;
+        gps[TdxGp::R13] = *r13;
+        gps[TdxGp::R14] = *r14;
+        gps[TdxGp::R15] = *r15;
+        self.vp.backing.vtls[self.vtl].private_regs.rip = *rip;
         // BUGBUG: rflags set also updates interrupts in hcl
-        enter_state.rflags = *rflags;
+        self.vp.backing.vtls[self.vtl].private_regs.rflags = *rflags;
 
         // Set segment registers
         self.vp.write_segment(self.vtl, TdxSegmentReg::Cs, *cs)?;
@@ -2951,7 +2898,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
 
         // CR2 is shared with the kernel, so set it in the VP run page which
         // will be set before lower VTL entry.
-        self.vp.runner.tdx_vp_state_mut().cr2 = *cr2;
+        self.vp.runner.set_cr2(*cr2);
 
         self.vp
             .runner
@@ -3056,12 +3003,13 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
 
     fn xss(&mut self) -> Result<vp::Xss, Self::Error> {
         Ok(vp::Xss {
-            value: self.vp.runner.tdx_vp_state().msr_xss,
+            value: self.vp.backing.vtls[self.vtl].private_regs.msr_xss,
         })
     }
 
-    fn set_xss(&mut self, _value: &vp::Xss) -> Result<(), Self::Error> {
-        Err(vp_state::Error::Unimplemented("xss"))
+    fn set_xss(&mut self, value: &vp::Xss) -> Result<(), Self::Error> {
+        self.vp.backing.vtls[self.vtl].private_regs.msr_xss = value.value;
+        Ok(())
     }
 
     fn mtrrs(&mut self) -> Result<vp::Mtrrs, Self::Error> {
@@ -3093,7 +3041,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
     }
 
     fn virtual_msrs(&mut self) -> Result<vp::VirtualMsrs, Self::Error> {
-        let state = self.vp.runner.tdx_vp_state();
+        let state = &self.vp.backing.vtls[self.vtl].private_regs;
 
         let sysenter_cs = self
             .vp
@@ -3133,7 +3081,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
             sfmask,
         } = value;
 
-        let state = self.vp.runner.tdx_vp_state_mut();
+        let state = &mut self.vp.backing.vtls[self.vtl].private_regs;
         state.msr_kernel_gs_base = kernel_gs_base;
         state.msr_star = star;
         state.msr_lstar = lstar;
@@ -3232,11 +3180,14 @@ impl AccessVpState for UhVpStateAccess<'_, '_, TdxBacked> {
     }
 
     fn tsc_aux(&mut self) -> Result<vp::TscAux, Self::Error> {
-        Err(vp_state::Error::Unimplemented("tsc_aux"))
+        Ok(vp::TscAux {
+            value: self.vp.backing.vtls[self.vtl].private_regs.msr_tsc_aux,
+        })
     }
 
-    fn set_tsc_aux(&mut self, _value: &vp::TscAux) -> Result<(), Self::Error> {
-        Err(vp_state::Error::Unimplemented("tsc_aux"))
+    fn set_tsc_aux(&mut self, value: &vp::TscAux) -> Result<(), Self::Error> {
+        self.vp.backing.vtls[self.vtl].private_regs.msr_tsc_aux = value.value;
+        Ok(())
     }
 
     fn cet(&mut self) -> Result<vp::Cet, Self::Error> {
@@ -3325,31 +3276,30 @@ impl<'a, 'b, T> AsHandler<UhHypercallHandler<'a, 'b, T, TdxBacked>> for TdHyperc
 
 impl<T> HypercallIo for TdHypercall<'_, '_, T> {
     fn advance_ip(&mut self) {
-        let regs = self.0.vp.runner.tdx_enter_guest_state_mut();
-        regs.set_r10(0);
-        regs.rip = regs.rip.wrapping_add(4);
+        self.0.vp.runner.tdx_enter_guest_gps_mut()[TdxGp::R10] = 0;
+        self.0.vp.backing.vtls[self.0.intercepted_vtl]
+            .private_regs
+            .rip = self.0.vp.backing.vtls[self.0.intercepted_vtl]
+            .private_regs
+            .rip
+            .wrapping_add(4);
     }
 
     fn retry(&mut self, control: u64) {
-        self.0
-            .vp
-            .runner
-            .tdx_enter_guest_state_mut()
-            .set_r10(control);
-
+        self.0.vp.runner.tdx_enter_guest_gps_mut()[TdxGp::R10] = control;
         self.set_result(hvdef::hypercall::HypercallOutput::from(HvError::Timeout).into());
     }
 
     fn control(&mut self) -> u64 {
-        self.0.vp.runner.tdx_enter_guest_state().r10()
+        self.0.vp.runner.tdx_enter_guest_gps()[TdxGp::R10]
     }
 
     fn input_gpa(&mut self) -> u64 {
-        self.0.vp.runner.tdx_enter_guest_state().rdx()
+        self.0.vp.runner.tdx_enter_guest_gps()[TdxGp::RDX]
     }
 
     fn output_gpa(&mut self) -> u64 {
-        self.0.vp.runner.tdx_enter_guest_state().r8()
+        self.0.vp.runner.tdx_enter_guest_gps()[TdxGp::R8]
     }
 
     fn fast_register_pair_count(&mut self) -> usize {
@@ -3374,17 +3324,17 @@ impl<T> HypercallIo for TdHypercall<'_, '_, T> {
     }
 
     fn set_result(&mut self, n: u64) {
-        self.0.vp.runner.tdx_enter_guest_state_mut().set_r11(n);
+        self.0.vp.runner.tdx_enter_guest_gps_mut()[TdxGp::R11] = n;
     }
 
     fn fast_regs(&mut self, starting_pair_index: usize, buf: &mut [[u64; 2]]) {
-        let regs = self.0.vp.runner.tdx_enter_guest_state();
+        let regs = self.0.vp.runner.tdx_enter_guest_gps();
         let fx_state = self.0.vp.runner.fx_state();
         for (i, [low, high]) in buf.iter_mut().enumerate() {
             let index = i + starting_pair_index;
             if index == 0 {
-                *low = regs.rdx();
-                *high = regs.r8();
+                *low = regs[TdxGp::RDX];
+                *high = regs[TdxGp::R8];
             } else {
                 let value = u128::from_ne_bytes(fx_state.xmm[index - 1]);
                 *low = value as u64;
@@ -3420,10 +3370,10 @@ impl<T: CpuIo> hv1_hypercall::RetargetDeviceInterrupt for UhHypercallHandler<'_,
 impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressList for UhHypercallHandler<'_, '_, T, TdxBacked> {
     fn flush_virtual_address_list(
         &mut self,
-        processor_set: Vec<u32>,
+        processor_set: ProcessorSet<'_>,
         flags: HvFlushFlags,
         gva_ranges: &[HvGvaRange],
-    ) -> hvdef::HvRepResult {
+    ) -> HvRepResult {
         hv1_hypercall::FlushVirtualAddressListEx::flush_virtual_address_list_ex(
             self,
             processor_set,
@@ -3438,38 +3388,34 @@ impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressListEx
 {
     fn flush_virtual_address_list_ex(
         &mut self,
-        processor_set: Vec<u32>,
+        processor_set: ProcessorSet<'_>,
         flags: HvFlushFlags,
         gva_ranges: &[HvGvaRange],
-    ) -> hvdef::HvRepResult {
-        self.hcvm_validate_flush_inputs(&processor_set, flags, true)
+    ) -> HvRepResult {
+        self.hcvm_validate_flush_inputs(processor_set, flags, true)
             .map_err(|e| (e, 0))?;
 
         let vtl = self.intercepted_vtl;
         {
             let mut flush_state = self.vp.shared.flush_state[vtl].write();
 
-            // If there are too many provided gvas then promote this request to a flush entire.
-            // TODO TDX GUEST VSM do we need the extended check? I don't think so
-            if gva_ranges.len() > FLUSH_GVA_LIST_SIZE {
+            // If we fail to add ranges to the list for any reason then promote this request to a flush entire.
+            if let Err(()) = Self::add_ranges_to_tlb_flush_list(
+                &mut flush_state,
+                gva_ranges,
+                flags.use_extended_range_format(),
+            ) {
                 if flags.non_global_mappings_only() {
                     flush_state.s.flush_entire_non_global_counter += 1;
                 } else {
                     flush_state.s.flush_entire_counter += 1;
                 }
-            } else {
-                for range in gva_ranges {
-                    if flush_state.gva_list.len() == FLUSH_GVA_LIST_SIZE {
-                        flush_state.gva_list.pop_front();
-                    }
-                    flush_state.gva_list.push_back(*range);
-                    flush_state.s.gva_list_count += 1;
-                }
             }
         }
 
         // Send flush IPIs to the specified VPs.
-        self.wake_processors_for_tlb_flush(vtl, (!flags.all_processors()).then_some(processor_set));
+        self.vp
+            .wake_processors_for_tlb_flush(vtl, (!flags.all_processors()).then_some(processor_set));
 
         // Mark that this VP needs to wait for all TLB locks to be released before returning.
         self.vp.set_wait_for_tlb_locks(vtl);
@@ -3483,7 +3429,7 @@ impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressSpace
 {
     fn flush_virtual_address_space(
         &mut self,
-        processor_set: Vec<u32>,
+        processor_set: ProcessorSet<'_>,
         flags: HvFlushFlags,
     ) -> hvdef::HvResult<()> {
         hv1_hypercall::FlushVirtualAddressSpaceEx::flush_virtual_address_space_ex(
@@ -3499,10 +3445,10 @@ impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressSpaceEx
 {
     fn flush_virtual_address_space_ex(
         &mut self,
-        processor_set: Vec<u32>,
+        processor_set: ProcessorSet<'_>,
         flags: HvFlushFlags,
     ) -> hvdef::HvResult<()> {
-        self.hcvm_validate_flush_inputs(&processor_set, flags, false)?;
+        self.hcvm_validate_flush_inputs(processor_set, flags, false)?;
         let vtl = self.intercepted_vtl;
 
         {
@@ -3517,7 +3463,8 @@ impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressSpaceEx
         }
 
         // Send flush IPIs to the specified VPs.
-        self.wake_processors_for_tlb_flush(vtl, (!flags.all_processors()).then_some(processor_set));
+        self.vp
+            .wake_processors_for_tlb_flush(vtl, (!flags.all_processors()).then_some(processor_set));
 
         // Mark that this VP needs to wait for all TLB locks to be released before returning.
         self.vp.set_wait_for_tlb_locks(vtl);
@@ -3527,25 +3474,98 @@ impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressSpaceEx
 }
 
 impl<T: CpuIo> UhHypercallHandler<'_, '_, T, TdxBacked> {
-    pub fn wake_processors_for_tlb_flush(
-        &mut self,
-        _vtl: GuestVtl,
-        processor_set: Option<Vec<u32>>,
-    ) {
-        // TODO TDX GUEST VSM: Add additional checks? HCL checks that VP is active and in target VTL
-        if let Some(processors) = processor_set {
-            for vp in processors {
-                if self.vp.vp_index().index() != vp {
-                    self.vp.partition.vps[vp as usize].wake_vtl2();
-                }
+    fn add_ranges_to_tlb_flush_list(
+        flush_state: &mut TdxPartitionFlushState,
+        gva_ranges: &[HvGvaRange],
+        use_extended_range_format: bool,
+    ) -> Result<(), ()> {
+        // If there are more gvas than the list size there's no point in filling the list.
+        if gva_ranges.len() > FLUSH_GVA_LIST_SIZE {
+            return Err(());
+        }
+
+        for range in gva_ranges {
+            if use_extended_range_format && range.as_extended().large_page() {
+                // TDX does not provide a way to flush large page ranges,
+                // we have to promote this request to a flush entire.
+                return Err(());
             }
-        } else {
-            for vp in self.vp.partition.vps.iter() {
-                if self.vp.vp_index().index() != vp.cpu_index {
-                    vp.wake_vtl2();
-                }
+            if flush_state.gva_list.len() == FLUSH_GVA_LIST_SIZE {
+                flush_state.gva_list.pop_front();
+            }
+            flush_state.gva_list.push_back(*range);
+            flush_state.s.gva_list_count += 1;
+        }
+
+        Ok(())
+    }
+}
+
+impl UhProcessor<'_, TdxBacked> {
+    fn wake_processors_for_tlb_flush(
+        &mut self,
+        target_vtl: GuestVtl,
+        processor_set: Option<ProcessorSet<'_>>,
+    ) {
+        match processor_set {
+            Some(processors) => {
+                self.wake_processors_for_tlb_flush_inner(
+                    target_vtl,
+                    processors.iter().map(|x| x as usize),
+                );
+            }
+            None => {
+                self.wake_processors_for_tlb_flush_inner(target_vtl, 0..self.partition.vps.len())
             }
         }
+    }
+
+    fn wake_processors_for_tlb_flush_inner(
+        &mut self,
+        target_vtl: GuestVtl,
+        processors: impl Iterator<Item = usize>,
+    ) {
+        // Use SeqCst ordering to ensure that we are observing the most
+        // up-to-date value from other VPs. Otherwise we might not send a
+        // wake to a VP in a lower VTL, which could cause TLB lock holders
+        // to be stuck waiting until the target_vp happens to switch into
+        // VTL 2.
+        // We use a single fence to avoid having to take a SeqCst load
+        // for each VP.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        for target_vp in processors {
+            if self.vp_index().index() as usize != target_vp
+                && self.shared.active_vtl[target_vp].load(Ordering::Relaxed) == target_vtl as u8
+            {
+                self.partition.vps[target_vp].wake_vtl2();
+            }
+        }
+
+        // TODO TDX GUEST VSM: We need to wait here until all woken VPs actually enter VTL 2.
+    }
+}
+
+impl TlbFlushLockAccess for UhProcessor<'_, TdxBacked> {
+    fn flush(&mut self, vtl: GuestVtl) {
+        {
+            self.shared.flush_state[vtl].write().s.flush_entire_counter += 1;
+        }
+        self.wake_processors_for_tlb_flush(vtl, None);
+        self.set_wait_for_tlb_locks(vtl);
+    }
+
+    fn flush_entire(&mut self) {
+        for vtl in [GuestVtl::Vtl0, GuestVtl::Vtl1] {
+            self.shared.flush_state[vtl].write().s.flush_entire_counter += 1;
+        }
+        for vtl in [GuestVtl::Vtl0, GuestVtl::Vtl1] {
+            self.wake_processors_for_tlb_flush(vtl, None);
+            self.set_wait_for_tlb_locks(vtl);
+        }
+    }
+
+    fn set_wait_for_tlb_locks(&mut self, vtl: GuestVtl) {
+        Self::set_wait_for_tlb_locks(self, vtl);
     }
 }
 
