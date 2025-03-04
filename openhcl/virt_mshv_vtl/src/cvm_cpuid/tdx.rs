@@ -164,7 +164,7 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         results: &mut CpuidSubtable,
         extended_state_mask: u64,
     ) -> Result<(), CpuidResultsError> {
-        let xfd_supported = if let Some(support) = results.get(&1).map(
+        if let Some(support) = results.get(&1).map(
             |CpuidResult {
                  eax,
                  ebx: _,
@@ -182,14 +182,9 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
 
         let summary_mask = extended_state_mask & !xsave::X86X_XSAVE_LEGACY_FEATURES;
 
-        let mut _max_xfd_value: u32 = 0;
         for i in 0..=super::MAX_EXTENDED_STATE_ENUMERATION_SUBLEAF {
             if (1 << i) & summary_mask != 0 {
                 let result = Self::cpuid(CpuidFunction::ExtendedStateEnumeration.0, i);
-                let result_xfd = cpuid::ExtendedStateEnumerationSubleafNEcx::from(result.ecx).xfd();
-                if xfd_supported && result_xfd {
-                    _max_xfd_value |= 1 << i;
-                }
 
                 results.insert(i, result);
             }
