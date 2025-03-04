@@ -2179,30 +2179,6 @@ impl<T: CpuIo> hv1_hypercall::EnablePartitionVtl for UhHypercallHandler<'_, '_, 
     }
 }
 
-impl<T: CpuIo> hv1_hypercall::RetargetDeviceInterrupt for UhHypercallHandler<'_, '_, T, SnpBacked> {
-    fn retarget_interrupt(
-        &mut self,
-        device_id: u64,
-        address: u64,
-        data: u32,
-        params: hv1_hypercall::HvInterruptParameters<'_>,
-    ) -> hvdef::HvResult<()> {
-        let hv1_hypercall::HvInterruptParameters {
-            vector,
-            multicast,
-            target_processors,
-        } = params;
-        self.hcvm_retarget_interrupt(
-            device_id,
-            address,
-            data,
-            vector,
-            multicast,
-            target_processors,
-        )
-    }
-}
-
 impl<T: CpuIo> hv1_hypercall::VtlSwitchOps for UhHypercallHandler<'_, '_, T, SnpBacked> {
     fn advance_ip(&mut self) {
         let is_64bit = self.vp.long_mode(self.intercepted_vtl);

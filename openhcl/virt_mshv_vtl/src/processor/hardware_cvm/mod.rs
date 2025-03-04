@@ -678,6 +678,12 @@ impl<T: CpuIo, B: HardwareIsolatedBacking> UhHypercallHandler<'_, '_, T, B> {
         multicast: bool,
         target_processors: ProcessorSet<'_>,
     ) -> HvResult<()> {
+        let entry = hvdef::hypercall::InterruptEntry {
+            source: hvdef::hypercall::HvInterruptSource::MSI,
+            rsvd: 0,
+            data: [address as u32, data],
+        };
+
         // Before dispatching retarget_device_interrupt, add the device vector
         // to partition global device vector table and issue `proxy_irr_blocked`
         // filter wake request to other VPs
@@ -690,50 +696,36 @@ impl<T: CpuIo, B: HardwareIsolatedBacking> UhHypercallHandler<'_, '_, T, B> {
         // Update `proxy_irr_blocked` for this VP itself
         self.vp.update_proxy_irr_filter(self.intercepted_vtl);
 
+        // Request a remapping in vtl2 for the guest device interrupt vector
+        if self.vp.partition.isolation == virt::IsolationType::Tdx {
+            if let Some(redirected_vector) = self.vp.partition.hcl.map_redirected_device_interrupt(vector, true) {
+                let result = self.vp.partition.hcl.retarget_device_interrupt(
+                    device_id,
+                    entry,
+                    redirected_vector,
+                    multicast,
+                    target_processors,
+                    true,
+                );
+
+                match result {
+                    Err(HvError::InvalidVtlState) => {
+                        // If interrupt cannot be posted to current VTL, retry with proxy interrupt delivery
+                        self.vp.partition.hcl.map_redirected_device_interrupt(vector, false);
+                    }
+                    _ => return result,
+                }
+            }
+        }
+
         self.vp.partition.hcl.retarget_device_interrupt(
             device_id,
-            hvdef::hypercall::InterruptEntry {
-                source: hvdef::hypercall::HvInterruptSource::MSI,
-                rsvd: 0,
-                data: [address as u32, data],
-            },
+            entry,
             vector,
             multicast,
             target_processors,
+            false,
         )
-    }
-
-    pub fn hcvm_retarget_interrupt(
-        &mut self,
-        device_id: u64,
-        address: u64,
-        data: u32,
-        vector: u32,
-        multicast: bool,
-        target_processors: ProcessorSet<'_>,
-    ) -> HvResult<()> {
-        // It is unknown whether the interrupt is physical or virtual, so try both. Note that the
-        // actual response from the hypervisor can't really be trusted so:
-        // 1. Always invoke the virtual interrupt retargeting.
-        // 2. A failure from the physical interrupt retargeting is not necessarily a sign of a
-        // malicious hypervisor or a buggy guest, since the target could simply be a virtual one.
-        let hv_result = self.retarget_physical_interrupt(
-            device_id,
-            address,
-            data,
-            vector,
-            multicast,
-            target_processors,
-        );
-        let virtual_result = self.retarget_virtual_interrupt(
-            device_id,
-            address,
-            data,
-            vector,
-            multicast,
-            target_processors,
-        );
-        hv_result.or(virtual_result)
     }
 
     pub fn hcvm_validate_flush_inputs(
@@ -787,6 +779,46 @@ impl<T, B: HardwareIsolatedBacking> hv1_hypercall::GetVpRegisters
         }
 
         Ok(())
+    }
+}
+
+impl<T: CpuIo, B: HardwareIsolatedBacking> hv1_hypercall::RetargetDeviceInterrupt
+    for UhHypercallHandler<'_, '_, T, B>
+{
+    fn retarget_interrupt(
+        &mut self,
+        device_id: u64,
+        address: u64,
+        data: u32,
+        params: hv1_hypercall::HvInterruptParameters<'_>,
+    ) -> HvResult<()> {
+        let hv1_hypercall::HvInterruptParameters {
+            vector,
+            multicast,
+            target_processors,
+        } = params;
+        // It is unknown whether the interrupt is physical or virtual, so try both. Note that the
+        // actual response from the hypervisor can't really be trusted so:
+        // 1. Always invoke the virtual interrupt retargeting.
+        // 2. A failure from the physical interrupt retargeting is not necessarily a sign of a
+        // malicious hypervisor or a buggy guest, since the target could simply be a virtual one.
+        let hv_result = self.retarget_physical_interrupt(
+            device_id,
+            address,
+            data,
+            vector,
+            multicast,
+            target_processors,
+        );
+        let virtual_result = self.retarget_virtual_interrupt(
+            device_id,
+            address,
+            data,
+            vector,
+            multicast,
+            target_processors,
+        );
+        hv_result.or(virtual_result)
     }
 }
 

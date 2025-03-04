@@ -3344,34 +3344,6 @@ impl<T> HypercallIo for TdHypercall<'_, '_, T> {
     }
 }
 
-impl<T: CpuIo> hv1_hypercall::RetargetDeviceInterrupt for UhHypercallHandler<'_, '_, T, TdxBacked> {
-    fn retarget_interrupt(
-        &mut self,
-        device_id: u64,
-        address: u64,
-        data: u32,
-        params: hv1_hypercall::HvInterruptParameters<'_>,
-    ) -> hvdef::HvResult<()> {
-        let hv1_hypercall::HvInterruptParameters {
-            vector,
-            multicast,
-            target_processors,
-        } = params;
-
-        // Request a remapping in vtl2 for the guest device interrupt vector
-        let remapped_vector = self.vp.partition.hcl.remap_guest_interrupt(vector);
-
-        self.hcvm_retarget_interrupt(
-            device_id,
-            address,
-            data,
-            remapped_vector,
-            multicast,
-            target_processors,
-        )
-    }
-}
-
 impl<T: CpuIo> hv1_hypercall::FlushVirtualAddressList for UhHypercallHandler<'_, '_, T, TdxBacked> {
     fn flush_virtual_address_list(
         &mut self,
