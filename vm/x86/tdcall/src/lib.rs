@@ -396,11 +396,14 @@ fn set_page_attr(
 /// The error returned by [`accept_pages`].
 #[derive(Debug)]
 pub enum AcceptPagesError {
-    // TODO TDX: better error types
     /// Unknown error type.
     Unknown(TdCallResultCode),
     /// Setting page attributes failed after accepting,
     Attributes(TdCallResultCode),
+    /// Invalid operand
+    Invalid(TdCallResultCode),
+    /// Busy Operand
+    Busy(TdCallResultCode),
 }
 
 /// The page attributes to accept pages with.
@@ -443,7 +446,7 @@ pub fn accept_pages<T: Tdcall>(
             && range.len() >= x86defs::X64_LARGE_PAGE_SIZE
         {
             match tdcall_accept_pages(call, range.start_4k_gpn(), true) {
-                Ok(_) => {
+                Err(TdCallResultCode::PAGE_ALREADY_ACCEPTED) | Ok(_) => {
                     set_attributes(
                         call,
                         TdgMemPageAttrWriteRcx::new()
@@ -459,13 +462,17 @@ pub fn accept_pages<T: Tdcall>(
                     #[cfg(feature = "tracing")]
                     tracing::trace!("accept pages size mismatch returned");
                 }
-                Err(e) => return Err(AcceptPagesError::Unknown(e)),
+                Err(e) => match e {
+                    TdCallResultCode::OPERAND_BUSY => return Err(AcceptPagesError::Busy(e)),
+                    TdCallResultCode::OPERAND_INVALID => return Err(AcceptPagesError::Invalid(e)),
+                    _ => return Err(AcceptPagesError::Unknown(e)),
+                },
             }
         }
 
         // Accept in 4k size pages
         match tdcall_accept_pages(call, range.start_4k_gpn(), false) {
-            Ok(_) => {
+            Err(TdCallResultCode::PAGE_ALREADY_ACCEPTED) | Ok(_) => {
                 set_attributes(
                     call,
                     TdgMemPageAttrWriteRcx::new()
@@ -475,7 +482,11 @@ pub fn accept_pages<T: Tdcall>(
 
                 range = MemoryRange::new(range.start() + HV_PAGE_SIZE..range.end());
             }
-            Err(e) => return Err(AcceptPagesError::Unknown(e)),
+            Err(e) => match e {
+                TdCallResultCode::OPERAND_BUSY => return Err(AcceptPagesError::Busy(e)),
+                TdCallResultCode::OPERAND_INVALID => return Err(AcceptPagesError::Invalid(e)),
+                _ => return Err(AcceptPagesError::Unknown(e)),
+            },
         }
     }
 
@@ -578,7 +589,15 @@ pub fn tdcall_map_gpa(
 
         let output = call.tdcall(input);
 
-        // TODO TDX: check rax return code
+        // This assertion failing means something has gone horribly wrong with the
+        // TDX module, as this call should always succeed with hypercall errors
+        // returned in r10.
+        assert_eq!(
+            output.rax.code(),
+            TdCallResultCode::SUCCESS,
+            "unexpected nonzero rax {:x} returned by tdcall vmcall",
+            u64::from(output.rax)
+        );
 
         let result = TdVmCallR10Result(output.r10);
 
