@@ -446,7 +446,7 @@ pub fn accept_pages<T: Tdcall>(
             && range.len() >= x86defs::X64_LARGE_PAGE_SIZE
         {
             match tdcall_accept_pages(call, range.start_4k_gpn(), true) {
-                Err(TdCallResultCode::PAGE_ALREADY_ACCEPTED) | Ok(_) => {
+                Ok(_) => {
                     set_attributes(
                         call,
                         TdgMemPageAttrWriteRcx::new()
@@ -458,13 +458,16 @@ pub fn accept_pages<T: Tdcall>(
                         MemoryRange::new(range.start() + x86defs::X64_LARGE_PAGE_SIZE..range.end());
                     continue;
                 }
-                Err(TdCallResultCode::PAGE_SIZE_MISMATCH) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::trace!("accept pages size mismatch returned");
-                }
                 Err(e) => match e {
                     TdCallResultCode::OPERAND_BUSY => return Err(AcceptPagesError::Busy(e)),
                     TdCallResultCode::OPERAND_INVALID => return Err(AcceptPagesError::Invalid(e)),
+                    TdCallResultCode::PAGE_ALREADY_ACCEPTED => {
+                        assert_eq!(e, TdCallResultCode::SUCCESS, "page already accepted");
+                    }
+                    TdCallResultCode::PAGE_SIZE_MISMATCH => {
+                        #[cfg(feature = "tracing")]
+                        tracing::trace!("accept pages size mismatch returned");
+                    }
                     _ => return Err(AcceptPagesError::Unknown(e)),
                 },
             }
@@ -472,7 +475,7 @@ pub fn accept_pages<T: Tdcall>(
 
         // Accept in 4k size pages
         match tdcall_accept_pages(call, range.start_4k_gpn(), false) {
-            Err(TdCallResultCode::PAGE_ALREADY_ACCEPTED) | Ok(_) => {
+            Ok(_) => {
                 set_attributes(
                     call,
                     TdgMemPageAttrWriteRcx::new()
@@ -485,6 +488,9 @@ pub fn accept_pages<T: Tdcall>(
             Err(e) => match e {
                 TdCallResultCode::OPERAND_BUSY => return Err(AcceptPagesError::Busy(e)),
                 TdCallResultCode::OPERAND_INVALID => return Err(AcceptPagesError::Invalid(e)),
+                TdCallResultCode::PAGE_ALREADY_ACCEPTED => {
+                    assert_eq!(e, TdCallResultCode::SUCCESS, "page already accepted");
+                }
                 _ => return Err(AcceptPagesError::Unknown(e)),
             },
         }
