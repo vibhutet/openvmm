@@ -462,7 +462,7 @@ pub fn accept_pages<T: Tdcall>(
                     TdCallResultCode::OPERAND_BUSY => return Err(AcceptPagesError::Busy(e)),
                     TdCallResultCode::OPERAND_INVALID => return Err(AcceptPagesError::Invalid(e)),
                     TdCallResultCode::PAGE_ALREADY_ACCEPTED => {
-                        assert_eq!(e, TdCallResultCode::SUCCESS, "page already accepted");
+                        panic!("page {} already accepted", range.start_4k_gpn());
                     }
                     TdCallResultCode::PAGE_SIZE_MISMATCH => {
                         #[cfg(feature = "tracing")]
@@ -489,7 +489,7 @@ pub fn accept_pages<T: Tdcall>(
                 TdCallResultCode::OPERAND_BUSY => return Err(AcceptPagesError::Busy(e)),
                 TdCallResultCode::OPERAND_INVALID => return Err(AcceptPagesError::Invalid(e)),
                 TdCallResultCode::PAGE_ALREADY_ACCEPTED => {
-                    assert_eq!(e, TdCallResultCode::SUCCESS, "page already accepted");
+                    panic!("page {} already accepted", range.start_4k_gpn());
                 }
                 _ => return Err(AcceptPagesError::Unknown(e)),
             },
