@@ -4,8 +4,6 @@
 //! This module implements a page memory allocator for allocating pages from a
 //! given portion of the guest address space.
 
-#![warn(missing_docs)]
-
 mod device_dma;
 
 pub use device_dma::PagePoolDmaBuffer;
@@ -16,24 +14,24 @@ use inspect::Response;
 use memory_range::MemoryRange;
 use parking_lot::Mutex;
 use safeatomic::AtomicSliceOps;
-use sparse_mmap::alloc_shared_memory;
 use sparse_mmap::Mappable;
 use sparse_mmap::MappableRef;
 use sparse_mmap::SparseMapping;
+use sparse_mmap::alloc_shared_memory;
 use std::fmt::Debug;
 use std::num::NonZeroU64;
-use std::sync::atomic::AtomicU8;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
 use thiserror::Error;
 
 const PAGE_SIZE: u64 = 4096;
 
 /// Save restore suport for [`PagePool`].
 pub mod save_restore {
+    use super::PAGE_SIZE;
     use super::PagePool;
     use super::Slot;
     use super::SlotState;
-    use super::PAGE_SIZE;
     use crate::ResolvedSlotState;
     use memory_range::MemoryRange;
     use mesh::payload::Protobuf;
@@ -448,6 +446,7 @@ pub trait PoolSource: Inspect + Send + Sync {
 pub struct TestMapper {
     #[inspect(skip)]
     mem: Mappable,
+    len: usize,
 }
 
 impl TestMapper {
@@ -456,7 +455,15 @@ impl TestMapper {
         let len = (size_pages * PAGE_SIZE) as usize;
         let fd = alloc_shared_memory(len).context("creating shared mem")?;
 
-        Ok(Self { mem: fd })
+        Ok(Self { mem: fd, len })
+    }
+
+    /// Returns [`SparseMapping`] that maps starting at page 0.
+    pub fn sparse_mapping(&self) -> SparseMapping {
+        let mappable = self.mappable();
+        let mapping = SparseMapping::new(self.len).unwrap();
+        mapping.map_file(0, self.len, mappable, 0, true).unwrap();
+        mapping
     }
 
     fn inspect_extra(&self, resp: &mut Response<'_>) {
@@ -861,10 +868,10 @@ impl user_driver::DmaClient for PagePoolAllocator {
 
 #[cfg(test)]
 mod test {
+    use crate::PAGE_SIZE;
     use crate::PagePool;
     use crate::PoolSource;
     use crate::TestMapper;
-    use crate::PAGE_SIZE;
     use inspect::Inspect;
     use memory_range::MemoryRange;
     use safeatomic::AtomicSliceOps;
@@ -1035,9 +1042,11 @@ mod test {
         pool.restore(state).unwrap();
 
         let alloc = pool.allocator("test2".into()).unwrap();
-        assert!(alloc
-            .restore_alloc(a1.base_pfn, a1.size_pages.try_into().unwrap())
-            .is_err());
+        assert!(
+            alloc
+                .restore_alloc(a1.base_pfn, a1.size_pages.try_into().unwrap())
+                .is_err()
+        );
     }
 
     #[test]

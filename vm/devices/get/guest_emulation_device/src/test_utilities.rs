@@ -6,11 +6,11 @@ use crate::GedChannel;
 use crate::GuestConfig;
 use crate::GuestEmulationDevice;
 use crate::GuestFirmwareConfig;
-use get_protocol::test_utilities::TEST_VMGS_CAPACITY;
 use get_protocol::HostNotifications;
 use get_protocol::HostRequests;
 use get_protocol::SecureBootTemplateType;
 use get_protocol::UefiConsoleMode;
+use get_protocol::test_utilities::TEST_VMGS_CAPACITY;
 use get_resources::ged::GuestEmulationRequest;
 use get_resources::ged::GuestServicingFlags;
 use guestmem::GuestMemory;
@@ -333,7 +333,7 @@ pub struct TestGedClient {
     sender: mesh::Sender<GuestEmulationRequest>,
 }
 
-#[allow(dead_code)] // Tasks are spawned and just need to be held.
+#[expect(dead_code)] // Tasks are spawned and just need to be held.
 enum TestTask {
     Test(Task<Result<(), Error>>),
     Prod(TaskControl<GuestEmulationDevice, GedChannel<FlatRingMem>>),

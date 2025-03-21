@@ -21,12 +21,12 @@
 use anyhow::Context;
 use clap::Parser;
 use clap::ValueEnum;
+use hvlite_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use hvlite_defs::config::DeviceVtl;
 use hvlite_defs::config::Hypervisor;
 use hvlite_defs::config::PcatBootDevice;
 use hvlite_defs::config::Vtl2BaseAddressType;
 use hvlite_defs::config::X2ApicConfig;
-use hvlite_defs::config::DEFAULT_PCAT_BOOT_ORDER;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -91,6 +91,11 @@ pub struct Options {
     /// highest enabled VTL.
     #[clap(long, requires("hv"))]
     pub get: bool,
+
+    /// Disable GET and related devices for using the OpenHCL paravisor, even
+    /// when --vtl2 is passed.
+    #[clap(long, conflicts_with("get"))]
+    pub no_get: bool,
 
     /// The disk to use for the GET VMGS.
     ///
@@ -1138,7 +1143,7 @@ impl FromStr for SmtConfigCli {
     }
 }
 
-#[cfg_attr(not(guest_arch = "x86_64"), allow(dead_code))]
+#[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
 fn parse_x2apic(s: &str) -> Result<X2ApicConfig, &'static str> {
     let r = match s {
         "auto" => X2ApicConfig::Auto,

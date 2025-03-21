@@ -6,7 +6,7 @@
 //! These are used both by unit tests and by benchmarks.
 
 // Benchmarks do not use all the code here, but unit tests should.
-#![cfg_attr(not(test), allow(dead_code))]
+#![cfg_attr(not(test), expect(dead_code))]
 
 use super::protocol;
 use crate::InitState;
@@ -17,14 +17,14 @@ use crate::ScsiController;
 use crate::ScsiPath;
 use crate::Worker;
 use crate::WorkerError;
-use guestmem::ranges::PagedRange;
 use guestmem::GuestMemory;
 use guestmem::MemoryRead;
+use guestmem::ranges::PagedRange;
 use pal_async::task::Spawn;
 use pal_async::task::Task;
 use parking_lot::RwLock;
-use scsi::srb::SrbStatus;
 use scsi::ScsiOp;
+use scsi::srb::SrbStatus;
 use scsi_defs as scsi;
 use std::sync::Arc;
 use vmbus_async::queue::IncomingPacket;

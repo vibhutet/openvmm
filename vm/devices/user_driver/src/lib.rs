@@ -5,6 +5,7 @@
 
 // UNSAFETY: Manual memory management around buffers and mmap.
 #![expect(unsafe_code)]
+#![expect(missing_docs)]
 
 use inspect::Inspect;
 use interrupt::DeviceInterrupt;
@@ -12,7 +13,6 @@ use memory::MemoryBlock;
 use std::sync::Arc;
 
 pub mod backoff;
-pub mod emulated;
 pub mod interrupt;
 pub mod lockmem;
 pub mod memory;

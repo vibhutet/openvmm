@@ -14,15 +14,16 @@ cfg_if::cfg_if! {
         pub mod snp;
         pub mod tdx;
 
+        use crate::TlbFlushLockAccess;
         use crate::VtlCrash;
+        use bitvec::prelude::BitArray;
+        use bitvec::prelude::Lsb0;
         use hvdef::HvX64RegisterName;
-        use virt::vp::AccessVpState;
         use virt::vp::MpState;
         use virt::x86::MsrError;
         use virt_support_apic::LocalApic;
         use virt_support_x86emu::translate::TranslationRegisters;
-        use bitvec::prelude::BitArray;
-        use bitvec::prelude::Lsb0;
+        use virt::vp::AccessVpState;
     } else if #[cfg(guest_arch = "aarch64")] {
         use hv1_hypercall::Arm64RegisterState;
         use hvdef::HvArm64RegisterName;
@@ -34,21 +35,18 @@ cfg_if::cfg_if! {
 use super::Error;
 use super::UhPartitionInner;
 use super::UhVpInner;
-use crate::GuestVsmState;
 use crate::GuestVtl;
 use crate::WakeReason;
-use hcl::ioctl;
 use hcl::ioctl::ProcessorRunner;
 use hv1_emulator::message_queues::MessageQueues;
 use hv1_hypercall::HvRepResult;
 use hv1_structs::ProcessorSet;
 use hv1_structs::VtlArray;
-use hvdef::hypercall::HostVisibilityType;
 use hvdef::HvError;
 use hvdef::HvMessage;
 use hvdef::HvSynicSint;
-use hvdef::Vtl;
 use hvdef::NUM_SINTS;
+use hvdef::Vtl;
 use inspect::Inspect;
 use inspect::InspectMut;
 use pal::unix::affinity;
@@ -57,20 +55,19 @@ use pal_async::driver::Driver;
 use pal_async::driver::PollImpl;
 use pal_async::timer::PollTimer;
 use pal_uring::IdleControl;
-use parking_lot::Mutex;
 use private::BackingPrivate;
 use std::convert::Infallible;
 use std::future::poll_fn;
 use std::marker::PhantomData;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::Duration;
-use virt::io::CpuIo;
 use virt::Processor;
 use virt::StopVp;
 use virt::VpHaltReason;
 use virt::VpIndex;
+use virt::io::CpuIo;
 use vm_topology::processor::TargetVpInfo;
 use vmcore::vmtime::VmTimeAccess;
 
@@ -123,7 +120,6 @@ struct VtlsTlbLocked {
     vtl2: VtlArray<bool, 2>,
 }
 
-#[cfg_attr(guest_arch = "aarch64", allow(dead_code))]
 impl VtlsTlbLocked {
     fn get(&self, requesting_vtl: Vtl, target_vtl: GuestVtl) -> bool {
         match requesting_vtl {
@@ -152,7 +148,7 @@ impl VtlsTlbLocked {
 
 #[cfg(guest_arch = "x86_64")]
 #[derive(Inspect)]
-pub struct LapicState {
+pub(crate) struct LapicState {
     lapic: LocalApic,
     activity: MpState,
     nmi_pending: bool,
@@ -169,31 +165,30 @@ impl LapicState {
     }
 }
 
+struct BackingParams<'a, 'b, T: Backing> {
+    partition: &'a UhPartitionInner,
+    vp_info: &'a TargetVpInfo,
+    runner: &'a mut ProcessorRunner<'b, T::HclBacking<'b>>,
+}
+
 mod private {
-    use super::vp_state;
+    use super::BackingParams;
     use super::UhRunVpError;
-    use crate::processor::UhProcessor;
+    use super::vp_state;
     use crate::BackingShared;
     use crate::Error;
     use crate::GuestVtl;
-    use crate::UhPartitionInner;
-    use hcl::ioctl::ProcessorRunner;
+    use crate::processor::UhProcessor;
     use hv1_emulator::hv::ProcessorVtlHv;
     use hv1_emulator::synic::ProcessorSynic;
     use inspect::InspectMut;
     use std::future::Future;
-    use virt::io::CpuIo;
-    use virt::vp::AccessVpState;
     use virt::StopVp;
     use virt::VpHaltReason;
-    use vm_topology::processor::TargetVpInfo;
+    use virt::io::CpuIo;
+    use virt::vp::AccessVpState;
 
-    pub struct BackingParams<'a, 'b, T: BackingPrivate> {
-        pub(crate) partition: &'a UhPartitionInner,
-        pub(crate) vp_info: &'a TargetVpInfo,
-        pub(crate) runner: &'a mut ProcessorRunner<'b, T::HclBacking<'b>>,
-    }
-
+    #[expect(private_interfaces)]
     pub trait BackingPrivate: 'static + Sized + InspectMut + Sized {
         type HclBacking<'b>: hcl::ioctl::Backing<'b>;
         type EmulationCache;
@@ -264,27 +259,32 @@ mod private {
     }
 }
 
-pub struct BackingSharedParams {
-    pub(crate) cvm_state: Option<crate::UhCvmPartitionState>,
-    #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
-    pub(crate) vp_count: u32,
-}
-
 /// Processor backing.
 pub trait Backing: BackingPrivate {}
 
 impl<T: BackingPrivate> Backing for T {}
 
+pub(crate) struct BackingSharedParams {
+    pub cvm_state: Option<crate::UhCvmPartitionState>,
+    pub guest_vsm_available: bool,
+}
+
 /// Trait for processor backings that have hardware isolation support.
 #[cfg(guest_arch = "x86_64")]
-pub trait HardwareIsolatedBacking: Backing {
-    /// Gets the number of pages that will be allocated from the shared page pool
-    /// for each CPU.
-    fn shared_pages_required_per_cpu() -> u64;
+trait HardwareIsolatedBacking: Backing {
+    /// Gets CVM specific VP state.
+    fn cvm_state(&self) -> &crate::UhCvmVpState;
     /// Gets CVM specific VP state.
     fn cvm_state_mut(&mut self) -> &mut crate::UhCvmVpState;
     /// Gets CVM specific partition state.
     fn cvm_partition_state(shared: &Self::Shared) -> &crate::UhCvmPartitionState;
+    /// Gets a struct that can be used to interact with TLB flushing and
+    /// locking.
+    fn tlb_flush_lock_access<'a>(
+        vp_index: VpIndex,
+        partition: &'a UhPartitionInner,
+        shared: &'a Self::Shared,
+    ) -> impl TlbFlushLockAccess + 'a;
     /// Copies shared registers (per VSM TLFS spec) from the source VTL to
     /// the target VTL that will become active, and set the exit vtl
     fn switch_vtl(this: &mut UhProcessor<'_, Self>, source_vtl: GuestVtl, target_vtl: GuestVtl);
@@ -296,10 +296,10 @@ pub trait HardwareIsolatedBacking: Backing {
     ) -> TranslationRegisters;
 }
 
-#[cfg_attr(guest_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
 #[derive(Inspect, Debug)]
 #[inspect(tag = "reason")]
-pub enum SidecarExitReason {
+pub(crate) enum SidecarExitReason {
     #[inspect(transparent)]
     Exit(SidecarRemoveExit),
     #[inspect(transparent)]
@@ -307,10 +307,10 @@ pub enum SidecarExitReason {
     ManualRequest,
 }
 
-#[cfg_attr(guest_arch = "aarch64", allow(dead_code))]
+#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
 #[derive(Inspect, Debug)]
 #[inspect(tag = "exit")]
-pub enum SidecarRemoveExit {
+pub(crate) enum SidecarRemoveExit {
     Msr {
         #[inspect(hex)]
         msr: u32,
@@ -351,7 +351,6 @@ impl UhVpInner {
             waker: Default::default(),
             cpu_index,
             vp_info,
-            hv_start_enable_vtl_vp: VtlArray::from_fn(|_| Mutex::new(None)),
             sidecar_exit_reason: Default::default(),
         }
     }
@@ -378,7 +377,6 @@ impl UhVpInner {
         }
     }
 
-    #[cfg_attr(guest_arch = "aarch64", allow(dead_code))]
     pub fn set_sidecar_exit_reason(&self, reason: SidecarExitReason) {
         self.sidecar_exit_reason.lock().get_or_insert_with(|| {
             tracing::info!(?reason, "sidecar exit");
@@ -392,27 +390,24 @@ impl UhVpInner {
 pub enum UhRunVpError {
     /// Failed to run
     #[error("failed to run")]
-    Run(#[source] ioctl::Error),
+    Run(#[source] hcl::ioctl::Error),
     #[error("sidecar run error")]
     Sidecar(#[source] sidecar_client::SidecarError),
     /// Failed to access state for emulation
     #[error("failed to access state for emulation")]
-    EmulationState(#[source] ioctl::Error),
-    /// Failed to access state for hypercall handling
-    #[error("failed to access state for hypercall handling")]
-    HypercallState(#[source] ioctl::Error),
+    EmulationState(#[source] hcl::ioctl::Error),
     /// Failed to translate GVA
     #[error("failed to translate GVA")]
-    TranslateGva(#[source] ioctl::Error),
+    TranslateGva(#[source] hcl::ioctl::Error),
     /// Failed VTL access check
     #[error("failed VTL access check")]
-    VtlAccess(#[source] ioctl::Error),
+    VtlAccess(#[source] hcl::ioctl::Error),
     /// Failed to advance rip
     #[error("failed to advance rip")]
-    AdvanceRip(#[source] ioctl::Error),
+    AdvanceRip(#[source] hcl::ioctl::Error),
     /// Failed to set pending event
     #[error("failed to set pending event")]
-    Event(#[source] ioctl::Error),
+    Event(#[source] hcl::ioctl::Error),
     /// Guest accessed unaccepted gpa
     #[error("guest accessed unaccepted gpa {0}")]
     UnacceptedMemoryAccess(u64),
@@ -430,8 +425,6 @@ pub enum UhRunVpError {
     HypercallParameters(#[source] guestmem::GuestMemoryError),
     #[error("failed to write hypercall result")]
     HypercallResult(#[source] guestmem::GuestMemoryError),
-    #[error("failed to write hypercall control for retry")]
-    HypercallRetry(#[source] guestmem::GuestMemoryError),
     #[error("unexpected debug exception with dr6 value {0:#x}")]
     UnexpectedDebugException(u64),
     /// Handling an intercept on behalf of an invalid Lower VTL
@@ -444,7 +437,7 @@ pub enum UhRunVpError {
 pub enum ProcessorError {
     /// IOCTL error
     #[error("hcl error")]
-    Ioctl(#[from] ioctl::Error),
+    Ioctl(#[from] hcl::ioctl::Error),
     /// State access error
     #[error("state access error")]
     State(#[from] vp_state::Error),
@@ -639,11 +632,9 @@ impl<'p, T: Backing> Processor for UhProcessor<'p, T> {
                 return Err(VpHaltReason::Cancel);
             }
         } else {
-            {
-                let mut current = Default::default();
-                affinity::get_current_thread_affinity(&mut current).unwrap();
-                assert_eq!(&current, CpuSet::new().set(self.inner.cpu_index));
-            }
+            let mut current = Default::default();
+            affinity::get_current_thread_affinity(&mut current).unwrap();
+            assert_eq!(&current, CpuSet::new().set(self.inner.cpu_index));
 
             // Lower the priority of this VP thread so that the VM does not return
             // to VTL0 while there is still outstanding VTL2 work to do.
@@ -666,61 +657,63 @@ impl<'p, T: Backing> Processor for UhProcessor<'p, T> {
 
         loop {
             // Process VP activity and wait for the VP to be ready.
-            poll_fn(|cx| loop {
-                stop.check()?;
+            poll_fn(|cx| {
+                loop {
+                    stop.check()?;
 
-                // Clear the run VP cancel request.
-                self.runner.clear_cancel();
+                    // Clear the run VP cancel request.
+                    self.runner.clear_cancel();
 
-                // Cancel any pending timer.
-                self.vmtime.cancel_timeout();
+                    // Cancel any pending timer.
+                    self.vmtime.cancel_timeout();
 
-                // Ensure the waker is set.
-                if !last_waker
-                    .as_ref()
-                    .is_some_and(|waker| cx.waker().will_wake(waker))
-                {
-                    last_waker = Some(cx.waker().clone());
-                    self.inner.waker.write().clone_from(&last_waker);
-                }
-
-                // Process wakes.
-                let scan_irr = if self.inner.wake_reasons.load(Ordering::Relaxed) != 0 {
-                    self.handle_wake().map_err(VpHaltReason::Hypervisor)?
-                } else {
-                    [false, false].into()
-                };
-
-                if self.backing.untrusted_synic().is_some() {
-                    self.update_synic(GuestVtl::Vtl0, true);
-                }
-
-                for vtl in [GuestVtl::Vtl1, GuestVtl::Vtl0] {
-                    // Process interrupts.
-                    if self.backing.hv(vtl).is_some() {
-                        self.update_synic(vtl, false);
+                    // Ensure the waker is set.
+                    if !last_waker
+                        .as_ref()
+                        .is_some_and(|waker| cx.waker().will_wake(waker))
+                    {
+                        last_waker = Some(cx.waker().clone());
+                        self.inner.waker.write().clone_from(&last_waker);
                     }
 
-                    T::poll_apic(self, vtl, scan_irr[vtl] || first_scan_irr)
-                        .map_err(VpHaltReason::Hypervisor)?;
-                }
-                first_scan_irr = false;
+                    // Process wakes.
+                    let scan_irr = if self.inner.wake_reasons.load(Ordering::Relaxed) != 0 {
+                        self.handle_wake().map_err(VpHaltReason::Hypervisor)?
+                    } else {
+                        [false, false].into()
+                    };
 
-                if T::handle_cross_vtl_interrupts(self, dev)
-                    .map_err(VpHaltReason::InvalidVmState)?
-                {
-                    continue;
-                }
+                    if self.backing.untrusted_synic().is_some() {
+                        self.update_synic(GuestVtl::Vtl0, true);
+                    }
 
-                // Arm the timer.
-                if let Some(timeout) = self.vmtime.get_timeout() {
-                    let deadline = self.vmtime.host_time(timeout);
-                    if self.timer.poll_timer(cx, deadline).is_ready() {
+                    for vtl in [GuestVtl::Vtl1, GuestVtl::Vtl0] {
+                        // Process interrupts.
+                        if self.backing.hv(vtl).is_some() {
+                            self.update_synic(vtl, false);
+                        }
+
+                        T::poll_apic(self, vtl, scan_irr[vtl] || first_scan_irr)
+                            .map_err(VpHaltReason::Hypervisor)?;
+                    }
+                    first_scan_irr = false;
+
+                    if T::handle_cross_vtl_interrupts(self, dev)
+                        .map_err(VpHaltReason::InvalidVmState)?
+                    {
                         continue;
                     }
-                }
 
-                return <Result<_, VpHaltReason<_>>>::Ok(()).into();
+                    // Arm the timer.
+                    if let Some(timeout) = self.vmtime.get_timeout() {
+                        let deadline = self.vmtime.host_time(timeout);
+                        if self.timer.poll_timer(cx, deadline).is_ready() {
+                            continue;
+                        }
+                    }
+
+                    return <Result<_, VpHaltReason<_>>>::Ok(()).into();
+                }
             })
             .await?;
 
@@ -781,13 +774,13 @@ impl<'a, T: Backing> UhProcessor<'a, T> {
         let inner = partition.vp(vp_info.base.vp_index).unwrap();
         let mut runner = partition
             .hcl
-            .runner(inner.cpu_index, idle_control.is_none())
+            .runner(inner.vp_index().index(), idle_control.is_none())
             .unwrap();
 
         let backing_shared = T::shared(&partition.backing_shared);
 
         let backing = T::new(
-            private::BackingParams {
+            BackingParams {
                 partition,
                 vp_info: &vp_info,
                 runner: &mut runner,
@@ -908,7 +901,7 @@ impl<'a, T: Backing> UhProcessor<'a, T> {
     }
 
     fn vp_index(&self) -> VpIndex {
-        self.inner.vp_info.base.vp_index
+        self.inner.vp_index()
     }
 
     #[cfg(guest_arch = "x86_64")]
@@ -1012,13 +1005,6 @@ impl<'a, T: Backing> UhProcessor<'a, T> {
             devices,
         )
         .await
-    }
-
-    fn vtl1_supported(&self) -> bool {
-        !matches!(
-            *self.partition.guest_vsm.read(),
-            GuestVsmState::NotPlatformSupported
-        )
     }
 
     fn deliver_synic_messages(&mut self, vtl: GuestVtl, sints: u16) {
@@ -1280,32 +1266,6 @@ impl<T: CpuIo, B: Backing> UhHypercallHandler<'_, '_, T, B> {
             .as_ref()
             .expect("should exist if this intercept is registered or this is a CVM")
             .retarget_interrupt(device_id, address, data, &vpci_params)
-    }
-}
-
-impl<T: CpuIo, B: Backing> hv1_hypercall::QuerySparseGpaPageHostVisibility
-    for UhHypercallHandler<'_, '_, T, B>
-{
-    fn query_gpa_visibility(
-        &mut self,
-        partition_id: u64,
-        gpa_pages: &[u64],
-        host_visibility: &mut [HostVisibilityType],
-    ) -> HvRepResult {
-        if partition_id != hvdef::HV_PARTITION_ID_SELF {
-            return Err((HvError::AccessDenied, 0));
-        }
-
-        if self.vp.partition.hide_isolation {
-            return Err((HvError::AccessDenied, 0));
-        }
-
-        self.vp
-            .partition
-            .isolated_memory_protector
-            .as_ref()
-            .ok_or((HvError::AccessDenied, 0))?
-            .query_host_visibility(gpa_pages, host_visibility)
     }
 }
 

@@ -5,6 +5,7 @@
 
 // UNSAFETY: This crate's whole purpose is manual memory mapping and management.
 #![expect(unsafe_code)]
+#![expect(missing_docs)]
 
 pub mod ranges;
 
@@ -18,9 +19,9 @@ use std::ops::Deref;
 use std::ops::DerefMut;
 use std::ops::Range;
 use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
 use thiserror::Error;
 use zerocopy::FromBytes;
 use zerocopy::FromZeros;
@@ -903,11 +904,11 @@ impl MemoryRegion {
         }
     }
 
-    // # Safety
-    //
-    // The caller must ensure that `offset + len` fits in this region, and that
-    // the object bitmap is currently valid for atomic read access from this
-    // thread.
+    /// # Safety
+    ///
+    /// The caller must ensure that `offset + len` fits in this region, and that
+    /// the object bitmap is currently valid for atomic read access from this
+    /// thread.
     unsafe fn check_access(
         &self,
         access_type: AccessType,
@@ -969,7 +970,9 @@ pub enum MultiRegionError {
     NotPowerOfTwo(u64),
     #[error("region size {0:#x} is smaller than a page")]
     RegionSizeTooSmall(u64),
-    #[error("too many regions ({region_count}) for region size {region_size:#x}; max is {max_region_count}")]
+    #[error(
+        "too many regions ({region_count}) for region size {region_size:#x}; max is {max_region_count}"
+    )]
     TooManyRegions {
         region_count: usize,
         max_region_count: usize,
@@ -1174,10 +1177,10 @@ impl GuestMemory {
         f().map_err(|err| self.wrap_err(gpa_len, op, err))
     }
 
-    // Creates a smaller view into guest memory, constraining accesses within the new boundaries. For smaller ranges,
-    // some memory implementations (e.g. HDV) may choose to lock the pages into memory for faster access. Locking
-    // random guest memory may cause issues, so only opt in to this behavior when the range can be considered "owned"
-    // by the caller.
+    /// Creates a smaller view into guest memory, constraining accesses within the new boundaries. For smaller ranges,
+    /// some memory implementations (e.g. HDV) may choose to lock the pages into memory for faster access. Locking
+    /// random guest memory may cause issues, so only opt in to this behavior when the range can be considered "owned"
+    /// by the caller.
     pub fn subrange(
         &self,
         offset: u64,
@@ -1195,6 +1198,16 @@ impl GuestMemory {
                 create_memory_subrange(self.inner.clone(), offset, len, allow_preemptive_locking)
             }
         })
+    }
+
+    /// Returns a subrange where pages from the subrange can be locked.
+    pub fn lockable_subrange(
+        &self,
+        offset: u64,
+        len: u64,
+    ) -> Result<GuestMemory, GuestMemoryError> {
+        // TODO: Enforce subrange is actually lockable.
+        self.subrange(offset, len, true)
     }
 
     /// Returns the mapping for all of guest memory.
@@ -1250,7 +1263,7 @@ impl GuestMemory {
                     true,
                 ) {
                     PageFaultAction::Fail(err) => {
-                        return Err(GuestMemoryBackingError::new(gpa + fault_offset, err))
+                        return Err(GuestMemoryBackingError::new(gpa + fault_offset, err));
                     }
                     PageFaultAction::Retry => {}
                     PageFaultAction::Fallback => break,
@@ -1294,7 +1307,7 @@ impl GuestMemory {
                             return Err(GuestMemoryBackingError::new(
                                 gpa + fault.offset() as u64,
                                 err,
-                            ))
+                            ));
                         }
                         PageFaultAction::Retry => {}
                         PageFaultAction::Fallback => return fallback(&mut param),
@@ -1304,6 +1317,9 @@ impl GuestMemory {
         }
     }
 
+    /// # Safety
+    ///
+    /// The caller must ensure that `src`..`src + len` is a valid buffer for reads.
     unsafe fn write_ptr(
         &self,
         gpa: u64,
@@ -1897,7 +1913,7 @@ impl Debug for LockedPages {
 
 #[derive(Copy, Clone, Debug)]
 // Field is read via slice transmute and pointer casts, not actually dead.
-struct PagePtr(#[allow(dead_code)] *const AtomicU8);
+struct PagePtr(#[expect(dead_code)] *const AtomicU8);
 
 // SAFETY: PagePtr is just a pointer with no methods and has no inherent safety
 // constraints.
@@ -2205,8 +2221,8 @@ pub trait UnmapRom: Send + Sync {
 mod tests {
     use crate::BitmapInfo;
     use crate::GuestMemory;
-    use crate::PageFaultAction;
     use crate::PAGE_SIZE64;
+    use crate::PageFaultAction;
     use sparse_mmap::SparseMapping;
     use std::ptr::NonNull;
     use std::sync::Arc;
