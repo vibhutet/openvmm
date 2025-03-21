@@ -605,7 +605,7 @@ mod ioctls {
     );
 
     ioctl_readwrite!(
-        /// Map VTL0 device interrupt in VTL2.
+        /// Map or unmap VTL0 device interrupt in VTL2.
         hcl_map_redirected_device_interrupt,
         MSHV_IOCTL,
         MSHV_MAP_REDIRECTED_DEVICE_INTERRUPT,
@@ -3248,7 +3248,7 @@ impl Hcl {
         }
     }
 
-    /// Map guest device interrupt vector in VTL2 kernel
+    /// Map or unmap guest device interrupt vector in VTL2 kernel
     pub fn map_redirected_device_interrupt(&self, vector: u32, create_mapping: bool) -> Option<u32> {
         let mut param = mshv_map_device_int {
             vector,

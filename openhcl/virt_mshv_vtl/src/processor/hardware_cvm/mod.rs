@@ -696,8 +696,10 @@ impl<T: CpuIo, B: HardwareIsolatedBacking> UhHypercallHandler<'_, '_, T, B> {
         // Update `proxy_irr_blocked` for this VP itself
         self.vp.update_proxy_irr_filter(self.intercepted_vtl);
 
-        // Request a remapping in vtl2 for the guest device interrupt vector
+        // For TDX guests, remap the vector in VTL2 with posted interrupts enabled
+        // as performance optimization.
         if self.vp.partition.isolation == virt::IsolationType::Tdx {
+            // If interrupt mapping fails in kernel, continue below with proxy interrupt delivery.
             if let Some(redirected_vector) = self.vp.partition.hcl.map_redirected_device_interrupt(vector, true) {
                 let result = self.vp.partition.hcl.retarget_device_interrupt(
                     device_id,
@@ -710,7 +712,7 @@ impl<T: CpuIo, B: HardwareIsolatedBacking> UhHypercallHandler<'_, '_, T, B> {
 
                 match result {
                     Err(HvError::InvalidVtlState) => {
-                        // If interrupt cannot be posted to current VTL, retry with proxy interrupt delivery
+                        // If Hyper-V cannot post this interrupt to current VTL, retry below with proxy interrupt delivery
                         self.vp.partition.hcl.map_redirected_device_interrupt(vector, false);
                     }
                     _ => return result,
