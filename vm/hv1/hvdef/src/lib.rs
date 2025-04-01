@@ -193,7 +193,12 @@ pub struct HvEnlightenmentInformation {
     pub use_hypercall_for_mmio_access: bool,
     pub use_gpa_pinning_hypercall: bool,
     pub wake_vps: bool,
-    _reserved: u8,
+    pub proxy_interrupt_doorbell_support: bool,
+    pub memory_type_locking_support: bool,
+    pub map_partition_event_log_buffer: bool,
+    pub posted_interrupt_redirection_support: bool,
+    #[bits(4)]
+    _reserved: u32,
     pub long_spin_wait_count: u32,
     #[bits(7)]
     pub implemented_physical_address_bits: u32,
