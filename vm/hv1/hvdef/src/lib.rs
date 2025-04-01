@@ -196,6 +196,8 @@ pub struct HvEnlightenmentInformation {
     pub proxy_interrupt_doorbell_support: bool,
     pub memory_type_locking_support: bool,
     pub map_partition_event_log_buffer: bool,
+    // TODO: Currently a placeholder, final bit position
+    //       to be updated after Hyper-V changes. 
     pub posted_interrupt_redirection_support: bool,
     #[bits(4)]
     _reserved: u32,
