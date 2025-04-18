@@ -197,8 +197,6 @@ impl CpuidArchInitializer for TdxCpuidInitializer {
         _address_space_sizes_ecx: cpuid::ExtendedAddressSpaceSizesEcx,
         _processor_topology_ebx: Option<cpuid::ProcessorTopologyDefinitionEbx>, // Will be None for Intel
     ) -> Result<super::ExtendedTopologyResult, CpuidResultsError> {
-        // TODO TDX: see HvlpInitializeCpuidTopologyIntel
-        // TODO TDX: fix returned errors
         if !version_and_features_edx.mt_per_socket() {
             if version_and_features_ebx.lps_per_package() > 1 {
                 return Err(CpuidResultsError::TopologyInconsistent(
