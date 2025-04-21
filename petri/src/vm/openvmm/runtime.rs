@@ -13,6 +13,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use futures::FutureExt;
 use futures_concurrency::future::Race;
+use get_resources::ged::FirmwareEvent;
 use hvlite_defs::rpc::PulseSaveRestoreError;
 use hyperv_ic_resources::shutdown::ShutdownRpc;
 use mesh::CancelContext;
@@ -64,6 +65,18 @@ impl PetriVm for PetriVmOpenVmm {
 
     async fn wait_for_vtl2_ready(&mut self) -> anyhow::Result<()> {
         Self::wait_for_vtl2_ready(self).await
+    }
+
+    async fn wait_for_successful_boot_event(&mut self) -> anyhow::Result<()> {
+        Self::wait_for_successful_boot_event(self).await
+    }
+
+    async fn wait_for_boot_event(&mut self) -> anyhow::Result<FirmwareEvent> {
+        Self::wait_for_boot_event(self).await
+    }
+
+    async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()> {
+        Self::send_enlightened_shutdown(self, kind).await
     }
 }
 
@@ -167,6 +180,11 @@ impl PetriVmOpenVmm {
         pub async fn wait_for_successful_boot_event(&mut self) -> anyhow::Result<()>
     );
     petri_vm_fn!(
+        /// Waits for an event emitted by the firmware about its boot status, and
+        /// returns that status.
+        pub async fn wait_for_boot_event(&mut self) -> anyhow::Result<FirmwareEvent>
+    );
+    petri_vm_fn!(
         /// Waits for the Hyper-V shutdown IC to be ready, returning a receiver
         /// that will be closed when it is no longer ready.
         pub async fn wait_for_enlightened_shutdown_ready(&mut self) -> anyhow::Result<mesh::OneshotReceiver<()>>
@@ -174,6 +192,11 @@ impl PetriVmOpenVmm {
     petri_vm_fn!(
         /// Instruct the guest to shutdown via the Hyper-V shutdown IC.
         pub async fn send_enlightened_shutdown(&mut self, kind: ShutdownKind) -> anyhow::Result<()>
+    );
+    petri_vm_fn!(
+        /// Waits for the KVP IC to be ready, returning a sender that can be used
+        /// to send requests to it.
+        pub async fn wait_for_kvp(&mut self) -> anyhow::Result<mesh::Sender<hyperv_ic_resources::kvp::KvpRpc>>
     );
     petri_vm_fn!(
         /// Restarts OpenHCL.
@@ -301,12 +324,7 @@ impl PetriVmInner {
 
     async fn wait_for_successful_boot_event(&mut self) -> anyhow::Result<()> {
         if let Some(expected_event) = self.resources.expected_boot_event {
-            let event = self
-                .resources
-                .firmware_event_recv
-                .recv()
-                .await
-                .context("Failed to get firmware boot event")?;
+            let event = self.wait_for_boot_event().await?;
 
             anyhow::ensure!(
                 event == expected_event,
@@ -317,6 +335,14 @@ impl PetriVmInner {
         }
 
         Ok(())
+    }
+
+    async fn wait_for_boot_event(&mut self) -> anyhow::Result<FirmwareEvent> {
+        self.resources
+            .firmware_event_recv
+            .recv()
+            .await
+            .context("Failed to get firmware boot event")
     }
 
     async fn wait_for_enlightened_shutdown_ready(
@@ -366,6 +392,20 @@ impl PetriVmInner {
         );
 
         Ok(())
+    }
+
+    async fn wait_for_kvp(
+        &mut self,
+    ) -> anyhow::Result<mesh::Sender<hyperv_ic_resources::kvp::KvpRpc>> {
+        tracing::info!("Waiting for KVP IC");
+        let (send, _) = self
+            .resources
+            .kvp_ic_send
+            .call_failable(hyperv_ic_resources::kvp::KvpConnectRpc::WaitForGuest, ())
+            .await
+            .context("failed to connect to KVP IC")?;
+
+        Ok(send)
     }
 
     async fn restart_openhcl(

@@ -242,6 +242,7 @@ pub fn create_host_channel(
             enable_vpci_boot: false,
             disable_frontpage: false,
             console_mode: UefiConsoleMode::DEFAULT,
+            default_boot_always_attempt: false,
         },
         com1: true,
         com2: true,
@@ -251,6 +252,7 @@ pub fn create_host_channel(
         secure_boot_enabled: false,
         secure_boot_template: SecureBootTemplateType::SECURE_BOOT_DISABLED,
         enable_battery: false,
+        no_persistent_secrets: true,
     };
 
     let halt_reason = Arc::new(Mutex::new(None));

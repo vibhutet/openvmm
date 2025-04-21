@@ -61,6 +61,7 @@ pub mod user_facing {
     pub use crate::new_flow_node;
     pub use crate::new_simple_flow_node;
     pub use crate::node::FlowPlatformLinuxDistro;
+    pub use crate::pipeline::Artifact;
 
     /// Helper method to streamline request validation in cases where a value is
     /// expected to be identical across all incoming requests.
@@ -245,6 +246,14 @@ impl<T: Serialize + DeserializeOwned> WriteVar<T, VarNotClaimed> {
         let val = ReadVar::from_static(val);
         val.write_into(ctx, self, |v| v);
     }
+
+    pub(crate) fn into_json(self) -> WriteVar<serde_json::Value> {
+        WriteVar {
+            backing_var: self.backing_var,
+            is_secret: self.is_secret,
+            _kind: std::marker::PhantomData,
+        }
+    }
 }
 
 impl<T: Serialize + DeserializeOwned, C> WriteVar<T, C> {
@@ -316,14 +325,14 @@ impl<U: Ord, T: ClaimVar> ClaimVar for BTreeMap<U, T> {
 
 macro_rules! impl_tuple_claim {
     ($($T:tt)*) => {
-        impl<$($T,)*> ClaimVar for ($($T,)*)
+        impl<$($T,)*> $crate::node::ClaimVar for ($($T,)*)
         where
-            $($T: ClaimVar,)*
+            $($T: $crate::node::ClaimVar,)*
         {
             type Claimed = ($($T::Claimed,)*);
 
             #[expect(non_snake_case)]
-            fn claim(self, ctx: &mut StepCtx<'_>) -> Self::Claimed {
+            fn claim(self, ctx: &mut $crate::node::StepCtx<'_>) -> Self::Claimed {
                 let ($($T,)*) = self;
                 ($($T.claim(ctx),)*)
             }
@@ -368,8 +377,7 @@ pub struct GhUserSecretVar(pub(crate) String);
 /// of a write into [`WriteVar`], whose API enforces that there can only ever be
 /// a single Write to a `WriteVar`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ReadVar<T: Serialize + DeserializeOwned, C = VarNotClaimed> {
-    #[serde(bound = "")] // work around serde/issues/1296
+pub struct ReadVar<T, C = VarNotClaimed> {
     backing_var: ReadVarBacking<T>,
     is_secret: bool,
     #[serde(skip)]
@@ -392,9 +400,8 @@ impl<T: Serialize + DeserializeOwned, C> Clone for ReadVar<T, C> {
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-enum ReadVarBacking<T: Serialize + DeserializeOwned> {
+enum ReadVarBacking<T> {
     RuntimeVar(String),
-    #[serde(bound = "")] // work around serde/issues/1296
     Inline(T),
     InlineSideEffect,
 }
@@ -474,13 +481,12 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
         F: FnOnce(T) -> U + 'static,
     {
         let this = self.clone();
-        ctx.emit_rust_step("🌼 write_into Var", move |ctx| {
+        ctx.emit_minor_rust_step("🌼 write_into Var", move |ctx| {
             let this = this.claim(ctx);
             let write_into = write_into.claim(ctx);
             move |rt| {
                 let this = rt.read(this);
                 rt.write(write_into, &f(this));
-                Ok(())
             }
         });
     }
@@ -497,7 +503,7 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
         let (read_from, write_into) =
             ctx.new_maybe_secret_var(self.is_secret || other.is_secret, "");
         let this = self.clone();
-        ctx.emit_rust_step("🌼 Zip Vars", move |ctx| {
+        ctx.emit_minor_rust_step("🌼 Zip Vars", move |ctx| {
             let this = this.claim(ctx);
             let other = other.claim(ctx);
             let write_into = write_into.claim(ctx);
@@ -505,7 +511,6 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
                 let this = rt.read(this);
                 let other = rt.read(other);
                 rt.write(write_into, &(this, other));
-                Ok(())
             }
         });
         read_from
@@ -551,7 +556,7 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
         T: 'static,
     {
         let (read_from, write_into) = ctx.new_maybe_secret_var(vec.iter().any(|v| v.is_secret), "");
-        ctx.emit_rust_step("🌼 Transpose Vec<ReadVar<T>>", move |ctx| {
+        ctx.emit_minor_rust_step("🌼 Transpose Vec<ReadVar<T>>", move |ctx| {
             let vec = vec.claim(ctx);
             let write_into = write_into.claim(ctx);
             move |rt| {
@@ -560,10 +565,39 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
                     v.push(rt.read(var));
                 }
                 rt.write(write_into, &v);
-                Ok(())
             }
         });
         read_from
+    }
+
+    /// Returns a new instance of this variable with an artificial dependency on
+    /// `other`.
+    ///
+    /// This is useful for making explicit a non-explicit dependency between the
+    /// two variables. For example, if `self` contains a path to a file, and
+    /// `other` is only written once that file has been created, then this
+    /// method can be used to return a new `ReadVar` which depends on `other`
+    /// but is otherwise identical to `self`. This ensures that when the new
+    /// variable is read, the file has been created.
+    ///
+    /// In general, it is better to ensure that the dependency is explicit, so
+    /// that if you have a variable with a path, then you know that the file
+    /// exists when you read it. This method is useful in cases where this is
+    /// not naturally the case, e.g., when you are providing a path as part of a
+    /// request, as opposed to the path being returned to you.
+    #[must_use]
+    pub fn depending_on<U>(&self, ctx: &mut NodeCtx<'_>, other: &ReadVar<U>) -> Self
+    where
+        T: 'static,
+        U: Serialize + DeserializeOwned + 'static,
+    {
+        // This could probably be handled without an additional Rust step with some
+        // additional work in the backend, but this is simple enough for now.
+        ctx.emit_minor_rust_stepv("🌼 Add dependency", |ctx| {
+            let this = self.clone().claim(ctx);
+            other.clone().claim(ctx);
+            move |rt| rt.read(this)
+        })
     }
 
     /// Consume this `ReadVar` outside the context of a step, signalling that it
@@ -573,6 +607,26 @@ impl<T: Serialize + DeserializeOwned> ReadVar<T> {
             ReadVarBacking::RuntimeVar(s) => ctx.backend.borrow_mut().on_unused_read_var(&s),
             ReadVarBacking::Inline(_) => {}
             ReadVarBacking::InlineSideEffect => {}
+        }
+    }
+
+    pub(crate) fn into_json(self) -> ReadVar<serde_json::Value> {
+        match self.backing_var {
+            ReadVarBacking::RuntimeVar(s) => ReadVar {
+                backing_var: ReadVarBacking::RuntimeVar(s),
+                is_secret: self.is_secret,
+                _kind: std::marker::PhantomData,
+            },
+            ReadVarBacking::Inline(v) => ReadVar {
+                backing_var: ReadVarBacking::Inline(serde_json::to_value(v).unwrap()),
+                is_secret: self.is_secret,
+                _kind: std::marker::PhantomData,
+            },
+            ReadVarBacking::InlineSideEffect => ReadVar {
+                backing_var: ReadVarBacking::InlineSideEffect,
+                is_secret: self.is_secret,
+                _kind: std::marker::PhantomData,
+            },
         }
     }
 }
@@ -679,6 +733,7 @@ pub trait NodeCtxBackend {
     fn on_emit_rust_step(
         &mut self,
         label: &str,
+        can_merge: bool,
         code: Box<dyn for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<()>>,
     );
 
@@ -858,18 +913,34 @@ impl<'ctx> NodeCtx<'ctx> {
         F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
         G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<()> + 'static,
     {
-        let (read, write) = self.new_maybe_secret_var(false, "auto_se");
+        self.emit_rust_step_inner(label.as_ref(), false, code)
+    }
 
-        let ctx = &mut StepCtx {
-            backend: self.backend.clone(),
-        };
-        write.claim(ctx);
-
-        let code = code(ctx);
-        self.backend
-            .borrow_mut()
-            .on_emit_rust_step(label.as_ref(), Box::new(code));
-        read
+    /// Emit a Rust-based step that cannot fail.
+    ///
+    /// This is equivalent to `emit_rust_step`, but it is for steps that cannot
+    /// fail and that do not need to be emitted as a separate step in a YAML
+    /// pipeline. This simplifies the pipeline logs.
+    ///
+    /// As a convenience feature, this function returns a special _optional_
+    /// [`ReadVar<SideEffect>`], which will not result in a "unused variable"
+    /// error if no subsequent step ends up claiming it.
+    pub fn emit_minor_rust_step<F, G>(
+        &mut self,
+        label: impl AsRef<str>,
+        code: F,
+    ) -> ReadVar<SideEffect>
+    where
+        F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
+        G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) + 'static,
+    {
+        self.emit_rust_step_inner(label.as_ref(), true, |ctx| {
+            let f = code(ctx);
+            |rt| {
+                f(rt);
+                Ok(())
+            }
+        })
     }
 
     /// Emit a Rust-based step, creating a new `ReadVar<T>` from the step's
@@ -893,10 +964,88 @@ impl<'ctx> NodeCtx<'ctx> {
     /// });
     ///
     /// // creating a new Var automatically
-    /// let read_foo = ctx.emit_rust_stepv("foo", |ctx| |rt| get_foo());
+    /// let read_foo = ctx.emit_rust_stepv("foo", |ctx| |rt| Ok(get_foo()));
     /// ```
     #[must_use]
     pub fn emit_rust_stepv<T, F, G>(&mut self, label: impl AsRef<str>, code: F) -> ReadVar<T>
+    where
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
+        G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<T> + 'static,
+    {
+        self.emit_rust_stepv_inner(label.as_ref(), false, code)
+    }
+
+    /// Emit a Rust-based step, creating a new `ReadVar<T>` from the step's
+    /// return value.
+    ///
+    /// This is equivalent to `emit_rust_stepv`, but it is for steps that cannot
+    /// fail and that do not need to be emitted as a separate step in a YAML
+    /// pipeline. This simplifies the pipeline logs.
+    ///
+    /// The var returned by this method is _not secret_. In order to create
+    /// secret variables, use the `ctx.new_var_secret()` method.
+    ///
+    /// This is a convenience function that streamlines the following common
+    /// flowey pattern:
+    ///
+    /// ```ignore
+    /// // creating a new Var explicitly
+    /// let (read_foo, write_foo) = ctx.new_var();
+    /// ctx.emit_minor_rust_step("foo", |ctx| {
+    ///     let write_foo = write_foo.claim(ctx);
+    ///     |rt| {
+    ///         rt.write(write_foo, &get_foo());
+    ///     }
+    /// });
+    ///
+    /// // creating a new Var automatically
+    /// let read_foo = ctx.emit_minor_rust_stepv("foo", |ctx| |rt| get_foo());
+    /// ```
+    #[must_use]
+    pub fn emit_minor_rust_stepv<T, F, G>(&mut self, label: impl AsRef<str>, code: F) -> ReadVar<T>
+    where
+        T: Serialize + DeserializeOwned + 'static,
+        F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
+        G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> T + 'static,
+    {
+        self.emit_rust_stepv_inner(label.as_ref(), true, |ctx| {
+            let f = code(ctx);
+            |rt| Ok(f(rt))
+        })
+    }
+
+    fn emit_rust_step_inner<F, G>(
+        &mut self,
+        label: &str,
+        can_merge: bool,
+        code: F,
+    ) -> ReadVar<SideEffect>
+    where
+        F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
+        G: for<'a> FnOnce(&'a mut RustRuntimeServices<'_>) -> anyhow::Result<()> + 'static,
+    {
+        let (read, write) = self.new_maybe_secret_var(false, "auto_se");
+
+        let ctx = &mut StepCtx {
+            backend: self.backend.clone(),
+        };
+        write.claim(ctx);
+
+        let code = code(ctx);
+        self.backend
+            .borrow_mut()
+            .on_emit_rust_step(label.as_ref(), can_merge, Box::new(code));
+        read
+    }
+
+    #[must_use]
+    fn emit_rust_stepv_inner<T, F, G>(
+        &mut self,
+        label: impl AsRef<str>,
+        can_merge: bool,
+        code: F,
+    ) -> ReadVar<T>
     where
         T: Serialize + DeserializeOwned + 'static,
         F: for<'a> FnOnce(&'a mut StepCtx<'_>) -> G,
@@ -912,6 +1061,7 @@ impl<'ctx> NodeCtx<'ctx> {
         let code = code(ctx);
         self.backend.borrow_mut().on_emit_rust_step(
             label.as_ref(),
+            can_merge,
             Box::new(|rt| {
                 let val = code(rt)?;
                 rt.write(write, &val);
@@ -2275,14 +2425,14 @@ macro_rules! new_flow_node {
         {
             type Request = <Node as FlowNode>::Request;
 
-            fn imports(&mut self, dep: &mut ImportCtx<'_>) {
+            fn imports(&mut self, dep: &mut $crate::node::ImportCtx<'_>) {
                 <Node as FlowNode>::imports(dep)
             }
 
             fn emit(
                 &mut self,
                 requests: Vec<Self::Request>,
-                ctx: &mut NodeCtx<'_>,
+                ctx: &mut $crate::node::NodeCtx<'_>,
             ) -> anyhow::Result<()> {
                 <Node as FlowNode>::emit(requests, ctx)
             }
@@ -2339,17 +2489,17 @@ macro_rules! new_simple_flow_node {
 
         impl $crate::node::FlowNodeBase for Node
         where
-            Node: SimpleFlowNode,
+            Node: $crate::node::SimpleFlowNode,
         {
-            type Request = <Node as SimpleFlowNode>::Request;
+            type Request = <Node as $crate::node::SimpleFlowNode>::Request;
 
-            fn imports(&mut self, dep: &mut ImportCtx<'_>) {
-                <Node as SimpleFlowNode>::imports(dep)
+            fn imports(&mut self, dep: &mut $crate::node::ImportCtx<'_>) {
+                <Node as $crate::node::SimpleFlowNode>::imports(dep)
             }
 
-            fn emit(&mut self, requests: Vec<Self::Request>, ctx: &mut NodeCtx<'_>) -> anyhow::Result<()> {
+            fn emit(&mut self, requests: Vec<Self::Request>, ctx: &mut $crate::node::NodeCtx<'_>) -> anyhow::Result<()> {
                 for req in requests {
-                    <Node as SimpleFlowNode>::process_request(req, ctx)?
+                    <Node as $crate::node::SimpleFlowNode>::process_request(req, ctx)?
                 }
 
                 Ok(())
@@ -2390,7 +2540,7 @@ macro_rules! __flowey_request_inner {
         $($rest:tt)*
     ) => {
         $(#[$a])*
-        #[derive(Serialize, Deserialize)]
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
         pub struct $variant($($tt)*);
 
         impl IntoRequest for $variant {
@@ -2409,7 +2559,7 @@ macro_rules! __flowey_request_inner {
         $($rest:tt)*
     ) => {
         $(#[$a])*
-        #[derive(Serialize, Deserialize)]
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
         pub struct $variant {
             $($tt)*
         }
@@ -2557,12 +2707,12 @@ macro_rules! flowey_request {
         }
     ) => {
         $(#[$a])*
-        #[derive(Serialize, Deserialize)]
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
         pub enum $req {
             $($tt)*
         }
 
-        impl IntoRequest for $req {
+        impl $crate::node::IntoRequest for $req {
             type Node = Node;
             fn into_request(self) -> $req {
                 self
@@ -2578,12 +2728,12 @@ macro_rules! flowey_request {
         }
     ) => {
         $(#[$a])*
-        #[derive(Serialize, Deserialize)]
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
         pub struct $req {
             $($tt)*
         }
 
-        impl IntoRequest for $req {
+        impl $crate::node::IntoRequest for $req {
             type Node = Node;
             fn into_request(self) -> $req {
                 self
@@ -2597,10 +2747,10 @@ macro_rules! flowey_request {
         pub struct $req:ident($($tt:tt)*);
     ) => {
         $(#[$a])*
-        #[derive(Serialize, Deserialize)]
+        #[derive($crate::reexports::Serialize, $crate::reexports::Deserialize)]
         pub struct $req($($tt)*);
 
-        impl IntoRequest for $req {
+        impl $crate::node::IntoRequest for $req {
             type Node = Node;
             fn into_request(self) -> $req {
                 self

@@ -8,6 +8,7 @@
 
 mod cli_args;
 mod crash_dump;
+mod kvp;
 mod meshworker;
 mod serial_io;
 mod storage_builder;
@@ -17,6 +18,7 @@ mod ttrpc;
 // `pub` so that the missing_docs warning fires for options without
 // documentation.
 pub use cli_args::Options;
+use console_relay::ConsoleLaunchOptions;
 
 use crate::cli_args::SecureBootTemplateCli;
 use anyhow::Context;
@@ -179,6 +181,7 @@ struct VmResources {
     console_in: Option<Box<dyn AsyncWrite + Send + Unpin>>,
     framebuffer_access: Option<FramebufferAccess>,
     shutdown_ic: Option<mesh::Sender<hyperv_ic_resources::shutdown::ShutdownRpc>>,
+    kvp_ic: Option<mesh::Sender<hyperv_ic_resources::kvp::KvpConnectRpc>>,
     scsi_rpc: Option<mesh::Sender<ScsiControllerRequest>>,
     ged_rpc: Option<mesh::Sender<get_resources::ged::GuestEmulationRequest>>,
     #[cfg(windows)]
@@ -248,12 +251,21 @@ fn vm_config_from_command_line(
             SerialConfigCli::Tcp(addr) => {
                 Some(serial_io::bind_tcp_serial(&addr).context("failed to bind serial")?)
             }
-            SerialConfigCli::NewConsole(app) => {
+            SerialConfigCli::NewConsole(app, window_title) => {
                 let path = console_relay::random_console_path();
                 let config =
                     serial_io::bind_serial(&path).context("failed to bind console serial")?;
-                console_relay::launch_console(app.or_else(openvmm_terminal_app).as_deref(), &path)
-                    .context("failed to launch console")?;
+                let window_title =
+                    window_title.unwrap_or_else(|| name.to_uppercase() + " [OpenVMM]");
+
+                console_relay::launch_console(
+                    app.or_else(openvmm_terminal_app).as_deref(),
+                    &path,
+                    ConsoleLaunchOptions {
+                        window_title: Some(window_title + " [OpenVMM]"),
+                    },
+                )
+                .context("failed to launch console")?;
 
                 Some(config)
             }
@@ -292,7 +304,7 @@ fn vm_config_from_command_line(
                 Some(io.config)
             }
             SerialConfigCli::Tcp(_addr) => anyhow::bail!("TCP virtio serial not supported"),
-            SerialConfigCli::NewConsole(app) => {
+            SerialConfigCli::NewConsole(app, window_title) => {
                 let path = console_relay::random_console_path();
 
                 let mut io = SerialIo::new().context("creating serial IO")?;
@@ -300,8 +312,17 @@ fn vm_config_from_command_line(
                     .with_context(|| format!("listening on pipe {}", path.display()))?
                     .detach();
 
-                console_relay::launch_console(app.or_else(openvmm_terminal_app).as_deref(), &path)
-                    .context("failed to launch console")?;
+                let window_title =
+                    window_title.unwrap_or_else(|| name.to_uppercase() + " [OpenVMM]");
+
+                console_relay::launch_console(
+                    app.or_else(openvmm_terminal_app).as_deref(),
+                    &path,
+                    ConsoleLaunchOptions {
+                        window_title: Some(window_title),
+                    },
+                )
+                .context("failed to launch console")?;
                 Some(io.config)
             }
         })
@@ -781,6 +802,7 @@ fn vm_config_from_command_line(
                 UefiConsoleModeCli::Com2 => UefiConsoleMode::Com2,
                 UefiConsoleModeCli::None => UefiConsoleMode::None,
             }),
+            default_boot_always_attempt: opt.default_boot_always_attempt,
         };
     } else {
         // Linux Direct
@@ -896,6 +918,7 @@ fn vm_config_from_command_line(
                                 UefiConsoleModeCli::Com2 => UefiConsoleMode::COM2,
                                 UefiConsoleModeCli::None => UefiConsoleMode::None,
                             },
+                            default_boot_always_attempt: opt.default_boot_always_attempt,
                         }
                     },
                     com1: with_vmbus_com1_serial,
@@ -922,6 +945,7 @@ fn vm_config_from_command_line(
                         },
                     },
                     enable_battery: opt.battery,
+                    no_persistent_secrets: true,
                 }
                 .into_resource(),
             ),
@@ -956,6 +980,7 @@ fn vm_config_from_command_line(
                 ak_cert_type: tpm_resources::TpmAkCertTypeResource::None,
                 register_layout,
                 guest_secret_key: None,
+                logger: None,
             }
             .into_resource(),
         });
@@ -1114,12 +1139,21 @@ fn vm_config_from_command_line(
     };
 
     if with_hv {
-        let (send, recv) = mesh::channel();
-        resources.shutdown_ic = Some(send);
-        vmbus_devices.push((
-            DeviceVtl::Vtl0,
-            hyperv_ic_resources::shutdown::ShutdownIcHandle { recv }.into_resource(),
-        ));
+        let (shutdown_send, shutdown_recv) = mesh::channel();
+        resources.shutdown_ic = Some(shutdown_send);
+        let (kvp_send, kvp_recv) = mesh::channel();
+        resources.kvp_ic = Some(kvp_send);
+        vmbus_devices.extend(
+            [
+                hyperv_ic_resources::shutdown::ShutdownIcHandle {
+                    recv: shutdown_recv,
+                }
+                .into_resource(),
+                hyperv_ic_resources::kvp::KvpIcHandle { recv: kvp_recv }.into_resource(),
+                hyperv_ic_resources::timesync::TimesyncIcHandle.into_resource(),
+            ]
+            .map(|r| (DeviceVtl::Vtl0, r)),
+        );
     }
 
     if let Some(hive_path) = &opt.imc {
@@ -1311,6 +1345,7 @@ fn vm_config_from_command_line(
         firmware_event_send: None,
         debugger_rpc: None,
         generation_id_recv: None,
+        rtc_delta_milliseconds: 0,
     };
 
     storage.build_config(&mut cfg, &mut resources, opt.scsi_sub_channels)?;
@@ -1619,7 +1654,8 @@ fn do_main() -> anyhow::Result<()> {
     }
 
     if let Some(path) = opt.relay_console_path {
-        return console_relay::relay_console(&path);
+        let console_title = opt.relay_console_title.unwrap_or_default();
+        return console_relay::relay_console(&path, console_title.as_str());
     }
 
     if let Some(path) = opt.ttrpc.as_ref().or(opt.grpc.as_ref()) {
@@ -1854,6 +1890,9 @@ enum InteractiveCommand {
 
     /// Inject an artificial panic into OpenVMM
     Panic,
+
+    /// Use KVP to interact with the guest.
+    Kvp(kvp::KvpCommand),
 }
 
 struct CommandParser {
@@ -2062,7 +2101,7 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
             let mut stdin = io::stdin();
             loop {
                 // Raw console text until Ctrl-Q.
-                term::set_raw_console(true);
+                term::set_raw_console(true).expect("failed to set raw console mode");
 
                 if let Some(input) = console_in.as_mut() {
                     let mut buf = [0; 32];
@@ -2082,7 +2121,7 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                     }
                 }
 
-                term::set_raw_console(false);
+                term::set_raw_console(false).expect("failed to set raw console mode");
 
                 loop {
                     let line = rl.readline("openvmm> ");
@@ -2659,6 +2698,9 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
                     let mut console = console_relay::Console::new(
                         driver.clone(),
                         term.or_else(openvmm_terminal_app).as_deref(),
+                        Some(ConsoleLaunchOptions {
+                            window_title: Some(format!("HVSock{} [OpenVMM]", port)),
+                        }),
                     )?;
                     driver
                         .spawn("console-relay", async move { console.relay(socket).await })
@@ -2814,6 +2856,15 @@ async fn run_control(driver: &DefaultDriver, mesh: &VmmMesh, opt: Options) -> an
 
                 if let Err(err) = vm_rpc.call(VmRpc::WriteMemory, (gpa, data)).await? {
                     eprintln!("error: {err:?}");
+                }
+            }
+            InteractiveCommand::Kvp(command) => {
+                let Some(kvp) = &resources.kvp_ic else {
+                    eprintln!("error: no kvp ic configured");
+                    continue;
+                };
+                if let Err(err) = kvp::handle_kvp(kvp, command).await {
+                    eprintln!("error: {err:#}");
                 }
             }
             InteractiveCommand::Input { .. } | InteractiveCommand::InputMode => unreachable!(),

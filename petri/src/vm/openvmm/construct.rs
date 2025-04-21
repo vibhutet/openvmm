@@ -198,7 +198,7 @@ impl PetriVmConfigOpenVmm {
         };
 
         setup.load_boot_disk(&mut devices, vtl2_settings.as_mut())?;
-        let expected_boot_event = setup.get_expected_boot_event();
+        let expected_boot_event = firmware.expected_boot_event();
 
         // Configure the serial ports now that they have been updated by the
         // OpenHCL configuration.
@@ -241,6 +241,19 @@ impl PetriVmConfigOpenVmm {
                 recv: shutdown_ic_recv,
             }
             .into_resource(),
+        ));
+
+        // Add the Hyper-V KVP IC
+        let (kvp_ic_send, kvp_ic_recv) = mesh::channel();
+        vmbus_devices.push((
+            DeviceVtl::Vtl0,
+            hyperv_ic_resources::kvp::KvpIcHandle { recv: kvp_ic_recv }.into_resource(),
+        ));
+
+        // Add the Hyper-V timesync IC
+        vmbus_devices.push((
+            DeviceVtl::Vtl0,
+            hyperv_ic_resources::timesync::TimesyncIcHandle.into_resource(),
         ));
 
         // Make a vmbus vsock path for pipette connections
@@ -330,6 +343,7 @@ impl PetriVmConfigOpenVmm {
             secure_boot_enabled: false,
             debugger_rpc: None,
             generation_id_recv: None,
+            rtc_delta_milliseconds: 0,
         };
 
         // Make the pipette connection listener.
@@ -361,6 +375,7 @@ impl PetriVmConfigOpenVmm {
                 log_stream_tasks,
                 firmware_event_recv,
                 shutdown_ic_send,
+                kvp_ic_send,
                 expected_boot_event,
                 ged_send,
                 pipette_listener,
@@ -554,6 +569,7 @@ impl PetriVmConfigSetupCore<'_> {
                     enable_serial: true,
                     enable_vpci_boot: false,
                     uefi_console_mode: Some(hvlite_defs::config::UefiConsoleMode::Com1),
+                    default_boot_always_attempt: false,
                 }
             }
             (
@@ -807,6 +823,7 @@ impl PetriVmConfigSetupCore<'_> {
                 disable_frontpage: true,
                 enable_vpci_boot: false,
                 console_mode: get_resources::ged::UefiConsoleMode::COM1,
+                default_boot_always_attempt: false,
             },
             com1: true,
             com2: true,
@@ -825,6 +842,7 @@ impl PetriVmConfigSetupCore<'_> {
             secure_boot_enabled: false,
             secure_boot_template: get_resources::ged::GuestSecureBootTemplateType::None,
             enable_battery: false,
+            no_persistent_secrets: true,
         };
 
         Ok((ged, guest_request_send))
@@ -860,27 +878,6 @@ impl PetriVmConfigSetupCore<'_> {
         } else {
             None
         })
-    }
-
-    fn get_expected_boot_event(&self) -> Option<FirmwareEvent> {
-        match &self.firmware {
-            Firmware::LinuxDirect { .. } | Firmware::OpenhclLinuxDirect { .. } => None,
-            Firmware::Pcat { .. } => {
-                // TODO: Handle older PCAT versions that don't fire the event
-                Some(FirmwareEvent::BootAttempt)
-            }
-            Firmware::Uefi {
-                guest: UefiGuest::None,
-                ..
-            }
-            | Firmware::OpenhclUefi {
-                guest: UefiGuest::None,
-                ..
-            } => Some(FirmwareEvent::NoBootDevice),
-            Firmware::Uefi { .. } | Firmware::OpenhclUefi { .. } => {
-                Some(FirmwareEvent::BootSuccess)
-            }
-        }
     }
 }
 

@@ -52,6 +52,7 @@ impl petri_artifacts_core::ResolveTestArtifact for OpenvmmKnownPathsTestArtifact
             _ if id == loadable::UEFI_FIRMWARE_AARCH64 => uefi_firmware_path(MachineArch::Aarch64),
 
             _ if id == openhcl_igvm::LATEST_STANDARD_X64 => openhcl_bin_path(MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::Standard),
+            _ if id == openhcl_igvm::LATEST_STANDARD_DEV_KERNEL_X64 => openhcl_bin_path(MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::StandardDevKernel),
             _ if id == openhcl_igvm::LATEST_CVM_X64 => openhcl_bin_path(MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::Cvm),
             _ if id == openhcl_igvm::LATEST_LINUX_DIRECT_TEST_X64 => openhcl_bin_path(MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::LinuxDirect),
             _ if id == openhcl_igvm::LATEST_STANDARD_AARCH64 => openhcl_bin_path(MachineArch::Aarch64, OpenhclVersion::Latest, OpenhclFlavor::Standard),
@@ -63,11 +64,20 @@ impl petri_artifacts_core::ResolveTestArtifact for OpenvmmKnownPathsTestArtifact
             _ if id == test_vhd::GUEST_TEST_UEFI_AARCH64 => guest_test_uefi_disk_path(MachineArch::Aarch64),
             _ if id == test_vhd::GEN1_WINDOWS_DATA_CENTER_CORE2022_X64 => get_guest_vhd_path(KnownVhd::Gen1WindowsDataCenterCore2022),
             _ if id == test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2022_X64 => get_guest_vhd_path(KnownVhd::Gen2WindowsDataCenterCore2022),
+            _ if id == test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64 => get_guest_vhd_path(KnownVhd::Gen2WindowsDataCenterCore2025),
             _ if id == test_vhd::FREE_BSD_13_2_X64 => get_guest_vhd_path(KnownVhd::FreeBsd13_2),
             _ if id == test_vhd::UBUNTU_2204_SERVER_X64 => get_guest_vhd_path(KnownVhd::Ubuntu2204Server),
             _ if id == test_vhd::UBUNTU_2404_SERVER_AARCH64 => get_guest_vhd_path(KnownVhd::Ubuntu2404ServerAarch64),
 
             _ if id == test_iso::FREE_BSD_13_2_X64 => get_guest_iso_path(KnownIso::FreeBsd13_2),
+
+            _ if id == test_vmgs::VMGS_WITH_BOOT_ENTRY => get_guest_vhd_path(KnownVhd::VmgsWithBootEntry),
+
+            _ if id == tmks::TMK_VMM_NATIVE => tmk_vmm_native_executable_path(),
+            _ if id == tmks::TMK_VMM_LINUX_X64_MUSL => tmk_vmm_paravisor_path(MachineArch::X86_64),
+            _ if id == tmks::TMK_VMM_LINUX_AARCH64_MUSL => tmk_vmm_paravisor_path(MachineArch::Aarch64),
+            _ if id == tmks::SIMPLE_TMK_X64 => simple_tmk_path(MachineArch::X86_64),
+            _ if id == tmks::SIMPLE_TMK_AARCH64 => simple_tmk_path(MachineArch::Aarch64),
 
             _ => anyhow::bail!("no support for given artifact type"),
         }
@@ -88,6 +98,7 @@ enum OpenhclVersion {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 enum OpenhclFlavor {
     Standard,
+    StandardDevKernel,
     Cvm,
     LinuxDirect,
 }
@@ -197,6 +208,48 @@ fn openvmm_native_executable_path() -> anyhow::Result<PathBuf> {
     get_output_executable_path("openvmm")
 }
 
+/// Path to the output location of the tmk_vmm executable.
+fn tmk_vmm_native_executable_path() -> anyhow::Result<PathBuf> {
+    get_output_executable_path("tmk_vmm")
+}
+
+fn tmk_vmm_paravisor_path(arch: MachineArch) -> anyhow::Result<PathBuf> {
+    let target = match arch {
+        MachineArch::X86_64 => "x86_64-unknown-linux-musl",
+        MachineArch::Aarch64 => "aarch64-unknown-linux-musl",
+    };
+    get_path(
+        format!("target/{target}/debug"),
+        "tmk_vmm",
+        MissingCommand::Build {
+            package: "tmk_vmm",
+            target: Some(target),
+        },
+    )
+}
+
+/// Path to the output location of the simple_tmk executable.
+fn simple_tmk_path(arch: MachineArch) -> anyhow::Result<PathBuf> {
+    let arch_str = match arch {
+        MachineArch::X86_64 => "x86_64",
+        MachineArch::Aarch64 => "aarch64",
+    };
+    let target = match arch {
+        MachineArch::X86_64 => "x86_64-unknown-none",
+        MachineArch::Aarch64 => "aarch64-minimal_rt-none",
+    };
+    get_path(
+        format!("target/{target}/debug"),
+        "simple_tmk",
+        MissingCommand::Custom {
+            description: "simple_tmk",
+            cmd: &format!(
+                "RUSTC_BOOTSTRAP=1 cargo build -p simple_tmk --config openhcl/minimal_rt/{arch_str}-config.toml"
+            ),
+        },
+    )
+}
+
 /// Path to our packaged linux direct test kernel.
 fn linux_direct_x64_test_kernel_path() -> anyhow::Result<PathBuf> {
     get_path(
@@ -289,6 +342,14 @@ fn openhcl_bin_path(
             MissingCommand::XFlowey {
                 description: "OpenHCL IGVM file",
                 xflowey_args: &["build-igvm", "x64"],
+            },
+        ),
+        (MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::StandardDevKernel) => (
+            "flowey-out/artifacts/build-igvm/debug/x64-devkern",
+            "openhcl-x64-devkern.bin",
+            MissingCommand::XFlowey {
+                description: "OpenHCL IGVM file",
+                xflowey_args: &["build-igvm", "x64-devkern"],
             },
         ),
         (MachineArch::X86_64, OpenhclVersion::Latest, OpenhclFlavor::Cvm) => (

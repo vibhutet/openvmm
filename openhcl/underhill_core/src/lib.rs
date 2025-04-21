@@ -22,6 +22,7 @@ mod reference_time;
 mod servicing;
 mod threadpool_vm_task_backend;
 mod vmbus_relay_unit;
+mod vmgs_logger;
 mod vp;
 mod vpci;
 mod worker;
@@ -319,6 +320,7 @@ async fn launch_workers(
         hide_isolation: opt.hide_isolation,
         nvme_keep_alive: opt.nvme_keep_alive,
         test_configuration: opt.test_configuration,
+        disable_uefi_frontpage: opt.disable_uefi_frontpage,
     };
 
     let (mut remote_console_cfg, framebuffer_access) =

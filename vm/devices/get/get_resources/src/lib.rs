@@ -86,6 +86,8 @@ pub mod ged {
         pub secure_boot_template: GuestSecureBootTemplateType,
         /// Enable battery.
         pub enable_battery: bool,
+        /// Suppress attestation and disable TPM state persistence.
+        pub no_persistent_secrets: bool,
     }
 
     /// The firmware and chipset configuration for the guest.
@@ -101,6 +103,8 @@ pub mod ged {
             disable_frontpage: bool,
             /// Where to send UEFI console output
             console_mode: UefiConsoleMode,
+            /// Perform a default boot even if boot entries exist and fail
+            default_boot_always_attempt: bool,
         },
         /// Boot from PC/AT BIOS with Hyper-V generation 1 devices.
         Pcat {

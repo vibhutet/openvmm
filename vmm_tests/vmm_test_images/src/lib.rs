@@ -26,9 +26,11 @@ use petri_artifacts_vmm_test::tags::IsHostedOnHvliteAzureBlobStore;
 pub enum KnownVhd {
     Gen1WindowsDataCenterCore2022,
     Gen2WindowsDataCenterCore2022,
+    Gen2WindowsDataCenterCore2025,
     FreeBsd13_2,
     Ubuntu2204Server,
     Ubuntu2404ServerAarch64,
+    VmgsWithBootEntry,
 }
 
 struct KnownVhdMeta {
@@ -60,6 +62,11 @@ const KNOWN_VHD_METADATA: &[KnownVhdMeta] = &[
         petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2022_X64::SIZE,
     ),
     KnownVhdMeta::new(
+        KnownVhd::Gen2WindowsDataCenterCore2025,
+        petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64::FILENAME,
+        petri_artifacts_vmm_test::artifacts::test_vhd::GEN2_WINDOWS_DATA_CENTER_CORE2025_X64::SIZE,
+    ),
+    KnownVhdMeta::new(
         KnownVhd::FreeBsd13_2,
         petri_artifacts_vmm_test::artifacts::test_vhd::FREE_BSD_13_2_X64::FILENAME,
         petri_artifacts_vmm_test::artifacts::test_vhd::FREE_BSD_13_2_X64::SIZE,
@@ -73,6 +80,11 @@ const KNOWN_VHD_METADATA: &[KnownVhdMeta] = &[
         KnownVhd::Ubuntu2404ServerAarch64,
         petri_artifacts_vmm_test::artifacts::test_vhd::UBUNTU_2404_SERVER_AARCH64::FILENAME,
         petri_artifacts_vmm_test::artifacts::test_vhd::UBUNTU_2404_SERVER_AARCH64::SIZE,
+    ),
+    KnownVhdMeta::new(
+        KnownVhd::VmgsWithBootEntry,
+        petri_artifacts_vmm_test::artifacts::test_vmgs::VMGS_WITH_BOOT_ENTRY::FILENAME,
+        petri_artifacts_vmm_test::artifacts::test_vmgs::VMGS_WITH_BOOT_ENTRY::SIZE,
     ),
 ];
 

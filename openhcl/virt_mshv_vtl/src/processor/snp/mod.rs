@@ -7,6 +7,7 @@ use super::BackingParams;
 use super::BackingPrivate;
 use super::BackingSharedParams;
 use super::HardwareIsolatedBacking;
+use super::InterceptMessageState;
 use super::UhEmulationState;
 use super::UhRunVpError;
 use super::hardware_cvm;
@@ -114,6 +115,7 @@ struct ExitStats {
     vmmcall: Counter,
     xsetbv: Counter,
     excp_db: Counter,
+    secure_reg_write: Counter,
 }
 
 enum UhDirectOverlay {
@@ -234,6 +236,75 @@ impl HardwareIsolatedBacking for SnpBacked {
             shared,
         }
     }
+
+    fn pending_event_vector(this: &UhProcessor<'_, Self>, vtl: GuestVtl) -> Option<u8> {
+        let event_inject = this.runner.vmsa(vtl).event_inject();
+        if event_inject.valid() {
+            Some(event_inject.vector())
+        } else {
+            None
+        }
+    }
+
+    fn set_pending_exception(
+        this: &mut UhProcessor<'_, Self>,
+        vtl: GuestVtl,
+        event: HvX64PendingExceptionEvent,
+    ) {
+        let inject_info = SevEventInjectInfo::new()
+            .with_valid(true)
+            .with_deliver_error_code(event.deliver_error_code())
+            .with_error_code(event.error_code())
+            .with_vector(event.vector().try_into().unwrap())
+            .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_EXCEPT);
+
+        this.runner.vmsa_mut(vtl).set_event_inject(inject_info);
+    }
+
+    fn cr0(this: &UhProcessor<'_, Self>, vtl: GuestVtl) -> u64 {
+        this.runner.vmsa(vtl).cr0()
+    }
+
+    fn cr4(this: &UhProcessor<'_, Self>, vtl: GuestVtl) -> u64 {
+        this.runner.vmsa(vtl).cr4()
+    }
+
+    fn intercept_message_state(
+        this: &UhProcessor<'_, Self>,
+        vtl: GuestVtl,
+    ) -> InterceptMessageState {
+        let vmsa = this.runner.vmsa(vtl);
+
+        InterceptMessageState {
+            instruction_length_and_cr8: (vmsa.next_rip() - vmsa.rip()) as u8,
+            cpl: vmsa.cpl(),
+            efer_lma: vmsa.efer() & x86defs::X64_EFER_LMA != 0,
+            cs_segment: virt_seg_from_snp(vmsa.cs()).into(),
+            rip: vmsa.rip(),
+            rflags: vmsa.rflags(),
+            rax: vmsa.rax(),
+            rdx: vmsa.rdx(),
+        }
+    }
+
+    fn cr_intercept_registration(
+        this: &mut UhProcessor<'_, Self>,
+        intercept_control: hvdef::HvRegisterCrInterceptControl,
+    ) {
+        // Intercept control is always managed by the hypervisor, so any request
+        // here is only opportunistic. Make the request directly with the
+        // hypervisor. Since intercept control always applies to VTL 1 control of
+        // VTL 0 state, the VTL 1 intercept control register is set here.
+        this.runner
+            .set_vp_registers_hvcall(
+                Vtl::Vtl1,
+                [(
+                    HvX64RegisterName::CrInterceptControl,
+                    u64::from(intercept_control),
+                )],
+            )
+            .expect("setting intercept control succeeds");
+    }
 }
 
 /// Partition-wide shared data for SNP VPs.
@@ -247,19 +318,19 @@ pub struct SnpBackedShared {
 impl SnpBackedShared {
     pub(crate) fn new(
         _partition_params: &UhPartitionNewParams<'_>,
-        params: BackingSharedParams,
+        params: BackingSharedParams<'_>,
     ) -> Result<Self, Error> {
         let cvm = params.cvm_state.unwrap();
         let invlpgb_count_max = x86defs::cpuid::ExtendedAddressSpaceSizesEdx::from(
-            cvm.cpuid
-                .registered_result(CpuidFunction::ExtendedAddressSpaceSizes, 0)
-                .edx,
+            params
+                .cpuid
+                .result(CpuidFunction::ExtendedAddressSpaceSizes.0, 0, &[0; 4])[3],
         )
         .invlpgb_count_max();
         let tsc_aux_virtualized = x86defs::cpuid::ExtendedSevFeaturesEax::from(
-            cvm.cpuid
-                .registered_result(CpuidFunction::ExtendedSevFeatures, 0)
-                .eax,
+            params
+                .cpuid
+                .result(CpuidFunction::ExtendedSevFeatures.0, 0, &[0; 4])[0],
         )
         .tsc_aux_virtualization();
 
@@ -456,9 +527,13 @@ impl BackingPrivate for SnpBacked {
         })
     }
 
+    fn handle_exit_activity(this: &mut UhProcessor<'_, Self>) {
+        this.cvm_handle_exit_activity();
+    }
+
     fn inspect_extra(this: &mut UhProcessor<'_, Self>, resp: &mut inspect::Response<'_>) {
         let vtl0_vmsa = this.runner.vmsa(GuestVtl::Vtl0);
-        let vtl1_vmsa = if this.backing.cvm_state().vtl1_enabled {
+        let vtl1_vmsa = if this.backing.cvm_state().vtl1.is_some() {
             Some(this.runner.vmsa(GuestVtl::Vtl1))
         } else {
             None
@@ -764,6 +839,10 @@ impl<'b> hardware_cvm::apic::ApicBacking<'b, SnpBacked> for UhProcessor<'b, SnpB
         // For now, just inject an NMI and hope for the best.
         // Don't forget to update handle_cross_vtl_interrupts if this code changes.
         let mut vmsa = self.runner.vmsa_mut(vtl);
+
+        // TODO GUEST VSM: Don't inject the NMI if there's already an event
+        // pending.
+
         vmsa.set_event_inject(
             SevEventInjectInfo::new()
                 .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_NMI)
@@ -893,6 +972,179 @@ impl UhProcessor<'_, SnpBacked> {
         Ok(())
     }
 
+    fn handle_msr_access(
+        &mut self,
+        dev: &impl CpuIo,
+        entered_from_vtl: GuestVtl,
+        msr: u32,
+        is_write: bool,
+    ) {
+        if is_write && self.cvm_try_protect_msr_write(entered_from_vtl, msr) {
+            return;
+        }
+
+        let vmsa = self.runner.vmsa_mut(entered_from_vtl);
+        let gp = if is_write {
+            let value = (vmsa.rax() as u32 as u64) | ((vmsa.rdx() as u32 as u64) << 32);
+
+            let r = self.backing.cvm.lapics[entered_from_vtl]
+                .lapic
+                .access(&mut SnpApicClient {
+                    partition: self.partition,
+                    vmsa,
+                    dev,
+                    vmtime: &self.vmtime,
+                    vtl: entered_from_vtl,
+                })
+                .msr_write(msr, value)
+                .or_else_if_unknown(|| self.write_msr_cvm(msr, value, entered_from_vtl))
+                .or_else_if_unknown(|| self.write_msr(msr, value, entered_from_vtl))
+                .or_else_if_unknown(|| self.write_msr_snp(dev, msr, value, entered_from_vtl));
+
+            match r {
+                Ok(()) => false,
+                Err(MsrError::Unknown) => {
+                    tracing::debug!(msr, value, "unknown cvm msr write");
+                    false
+                }
+                Err(MsrError::InvalidAccess) => true,
+            }
+        } else {
+            let r = self.backing.cvm.lapics[entered_from_vtl]
+                .lapic
+                .access(&mut SnpApicClient {
+                    partition: self.partition,
+                    vmsa,
+                    dev,
+                    vmtime: &self.vmtime,
+                    vtl: entered_from_vtl,
+                })
+                .msr_read(msr)
+                .or_else_if_unknown(|| self.read_msr(msr, entered_from_vtl))
+                .or_else_if_unknown(|| self.read_msr_cvm(dev, msr, entered_from_vtl))
+                .or_else_if_unknown(|| match msr {
+                    hvdef::HV_X64_MSR_GUEST_IDLE => {
+                        self.backing.cvm.lapics[entered_from_vtl].activity = MpState::Idle;
+                        let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
+                        vmsa.v_intr_cntrl_mut().set_intr_shadow(false);
+                        Ok(0)
+                    }
+                    _ => Err(MsrError::Unknown),
+                });
+
+            let value = match r {
+                Ok(v) => Some(v),
+                Err(MsrError::Unknown) => {
+                    tracing::debug!(msr, "unknown cvm msr read");
+                    Some(0)
+                }
+                Err(MsrError::InvalidAccess) => None,
+            };
+
+            if let Some(value) = value {
+                let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
+                vmsa.set_rax((value as u32).into());
+                vmsa.set_rdx(((value >> 32) as u32).into());
+                false
+            } else {
+                true
+            }
+        };
+
+        let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
+        if gp {
+            vmsa.set_event_inject(
+                SevEventInjectInfo::new()
+                    .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_EXCEPT)
+                    .with_vector(x86defs::Exception::GENERAL_PROTECTION_FAULT.0)
+                    .with_deliver_error_code(true)
+                    .with_valid(true),
+            );
+        } else {
+            advance_to_next_instruction(&mut vmsa);
+        }
+    }
+
+    fn handle_xsetbv(&mut self, entered_from_vtl: GuestVtl) {
+        let vmsa = self.runner.vmsa(entered_from_vtl);
+        if let Some(value) = hardware_cvm::validate_xsetbv_exit(hardware_cvm::XsetbvExitInput {
+            rax: vmsa.rax(),
+            rcx: vmsa.rcx(),
+            rdx: vmsa.rdx(),
+            cr4: vmsa.cr4(),
+            cpl: vmsa.cpl(),
+        }) {
+            if !self.cvm_try_protect_secure_register_write(
+                entered_from_vtl,
+                HvX64RegisterName::Xfem,
+                value,
+            ) {
+                let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
+                vmsa.set_xcr0(value);
+                advance_to_next_instruction(&mut vmsa);
+            }
+        } else {
+            let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
+            vmsa.set_event_inject(
+                SevEventInjectInfo::new()
+                    .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_EXCEPT)
+                    .with_vector(x86defs::Exception::GENERAL_PROTECTION_FAULT.0)
+                    .with_deliver_error_code(true)
+                    .with_valid(true),
+            );
+        }
+    }
+
+    fn handle_crx_intercept(&mut self, entered_from_vtl: GuestVtl, reg: HvX64RegisterName) {
+        let vmsa = self.runner.vmsa(entered_from_vtl);
+        let mov_crx_drx = x86defs::snp::MovCrxDrxInfo::from(vmsa.exit_info1());
+        let reg_value = {
+            let gpr_name =
+                HvX64RegisterName(HvX64RegisterName::Rax.0 + mov_crx_drx.gpr_number() as u32);
+
+            match gpr_name {
+                HvX64RegisterName::Rax => vmsa.rax(),
+                HvX64RegisterName::Rbx => vmsa.rbx(),
+                HvX64RegisterName::Rcx => vmsa.rcx(),
+                HvX64RegisterName::Rdx => vmsa.rdx(),
+                HvX64RegisterName::Rsp => vmsa.rsp(),
+                HvX64RegisterName::Rbp => vmsa.rbp(),
+                HvX64RegisterName::Rsi => vmsa.rsi(),
+                HvX64RegisterName::Rdi => vmsa.rdi(),
+                HvX64RegisterName::R8 => vmsa.r8(),
+                HvX64RegisterName::R9 => vmsa.r9(),
+                HvX64RegisterName::R10 => vmsa.r10(),
+                HvX64RegisterName::R11 => vmsa.r11(),
+                HvX64RegisterName::R12 => vmsa.r12(),
+                HvX64RegisterName::R13 => vmsa.r13(),
+                HvX64RegisterName::R14 => vmsa.r14(),
+                HvX64RegisterName::R15 => vmsa.r15(),
+                _ => unreachable!("unexpected register"),
+            }
+        };
+
+        // Special case: LMSW/CLTS/SMSW intercepts do not provide decode assist
+        // information. No support to emulate these instructions yet, but the
+        // access by the guest might be allowed by the higher VTL and therefore
+        // crashing is not necessarily the correct behavior.
+        //
+        // TODO SNP: consider emulating the instruction.
+        if !mov_crx_drx.mov_crx() {
+            tracelimit::warn_ratelimited!("Intercepted crx access, instruction is not mov crx");
+            return;
+        }
+
+        if !self.cvm_try_protect_secure_register_write(entered_from_vtl, reg, reg_value) {
+            let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
+            match reg {
+                HvX64RegisterName::Cr0 => vmsa.set_cr0(reg_value),
+                HvX64RegisterName::Cr4 => vmsa.set_cr4(reg_value),
+                _ => unreachable!(),
+            }
+            advance_to_next_instruction(&mut vmsa);
+        }
+    }
+
     #[must_use]
     fn sync_lazy_eoi(&mut self, vtl: GuestVtl) -> bool {
         if self.backing.cvm.lapics[vtl].lapic.is_lazy_eoi_pending() {
@@ -994,25 +1246,10 @@ impl UhProcessor<'_, SnpBacked> {
 
         let stat = match sev_error_code {
             SevExitCode::CPUID => {
-                let guest_state = crate::cvm_cpuid::CpuidGuestState {
-                    xfem: vmsa.xcr0(),
-                    xss: vmsa.xss(),
-                    cr4: vmsa.cr4(),
-                    apic_id: self.inner.vp_info.apic_id,
-                };
-
-                let result = self.shared.cvm.cpuid.guest_result(
-                    CpuidFunction(vmsa.rax() as u32),
-                    vmsa.rcx() as u32,
-                    &guest_state,
-                );
-
-                let [eax, ebx, ecx, edx] = self.partition.cpuid_result(
-                    vmsa.rax() as u32,
-                    vmsa.rcx() as u32,
-                    &[result.eax, result.ebx, result.ecx, result.edx],
-                );
-
+                let leaf = vmsa.rax() as u32;
+                let subleaf = vmsa.rcx() as u32;
+                let [eax, ebx, ecx, edx] = self.cvm_cpuid_result(entered_from_vtl, leaf, subleaf);
+                let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
                 vmsa.set_rax(eax.into());
                 vmsa.set_rbx(ebx.into());
                 vmsa.set_rcx(ecx.into());
@@ -1025,86 +1262,7 @@ impl UhProcessor<'_, SnpBacked> {
                 let is_write = vmsa.exit_info1() & 1 != 0;
                 let msr = vmsa.rcx() as u32;
 
-                let gp = if is_write {
-                    let value = (vmsa.rax() as u32 as u64) | ((vmsa.rdx() as u32 as u64) << 32);
-                    let r = self.backing.cvm.lapics[entered_from_vtl]
-                        .lapic
-                        .access(&mut SnpApicClient {
-                            partition: self.partition,
-                            vmsa,
-                            dev,
-                            vmtime: &self.vmtime,
-                            vtl: entered_from_vtl,
-                        })
-                        .msr_write(msr, value)
-                        .or_else_if_unknown(|| self.write_msr_cvm(msr, value, entered_from_vtl))
-                        .or_else_if_unknown(|| self.write_msr(msr, value, entered_from_vtl))
-                        .or_else_if_unknown(|| {
-                            self.write_msr_snp(dev, msr, value, entered_from_vtl)
-                        });
-
-                    match r {
-                        Ok(()) => false,
-                        Err(MsrError::Unknown) => {
-                            tracing::debug!(msr, value, "unknown cvm msr write");
-                            false
-                        }
-                        Err(MsrError::InvalidAccess) => true,
-                    }
-                } else {
-                    let r = self.backing.cvm.lapics[entered_from_vtl]
-                        .lapic
-                        .access(&mut SnpApicClient {
-                            partition: self.partition,
-                            vmsa,
-                            dev,
-                            vmtime: &self.vmtime,
-                            vtl: entered_from_vtl,
-                        })
-                        .msr_read(msr)
-                        .or_else_if_unknown(|| self.read_msr(msr, entered_from_vtl))
-                        .or_else_if_unknown(|| self.read_msr_cvm(dev, msr, entered_from_vtl))
-                        .or_else_if_unknown(|| match msr {
-                            hvdef::HV_X64_MSR_GUEST_IDLE => {
-                                self.backing.cvm.lapics[entered_from_vtl].activity = MpState::Idle;
-                                let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
-                                vmsa.v_intr_cntrl_mut().set_intr_shadow(false);
-                                Ok(0)
-                            }
-                            _ => Err(MsrError::Unknown),
-                        });
-
-                    let value = match r {
-                        Ok(v) => Some(v),
-                        Err(MsrError::Unknown) => {
-                            tracing::debug!(msr, "unknown cvm msr read");
-                            Some(0)
-                        }
-                        Err(MsrError::InvalidAccess) => None,
-                    };
-
-                    if let Some(value) = value {
-                        let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
-                        vmsa.set_rax((value as u32).into());
-                        vmsa.set_rdx(((value >> 32) as u32).into());
-                        false
-                    } else {
-                        true
-                    }
-                };
-
-                let mut vmsa = self.runner.vmsa_mut(entered_from_vtl);
-                if gp {
-                    vmsa.set_event_inject(
-                        SevEventInjectInfo::new()
-                            .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_EXCEPT)
-                            .with_vector(x86defs::Exception::GENERAL_PROTECTION_FAULT.0)
-                            .with_deliver_error_code(true)
-                            .with_valid(true),
-                    );
-                } else {
-                    advance_to_next_instruction(&mut vmsa);
-                }
+                self.handle_msr_access(dev, entered_from_vtl, msr, is_write);
 
                 if is_write {
                     &mut self.backing.exit_stats[entered_from_vtl].msr_write
@@ -1116,7 +1274,10 @@ impl UhProcessor<'_, SnpBacked> {
             SevExitCode::IOIO => {
                 let io_info = x86defs::snp::SevIoAccessInfo::from(vmsa.exit_info1() as u32);
                 if io_info.string_access() || io_info.rep_access() {
-                    self.emulate(dev, false, entered_from_vtl, ()).await?;
+                    let interruption_pending = vmsa.event_inject().valid()
+                        || SevEventInjectInfo::from(vmsa.exit_int_info()).valid();
+                    self.emulate(dev, interruption_pending, entered_from_vtl, ())
+                        .await?;
                 } else {
                     let len = if io_info.access_size32() {
                         4
@@ -1185,6 +1346,8 @@ impl UhProcessor<'_, SnpBacked> {
                 // unmapped memory. This means that accesses to unmapped memory for lower VTLs will be
                 // forwarded to underhill as a #VC exception.
                 let exit_info2 = vmsa.exit_info2();
+                let interruption_pending = vmsa.event_inject().valid()
+                    || SevEventInjectInfo::from(vmsa.exit_int_info()).valid();
                 let exit_message = self.runner.exit_message();
                 let emulate = match exit_message.header.typ {
                     HvMessageType::HvMessageTypeExceptionIntercept => {
@@ -1212,7 +1375,8 @@ impl UhProcessor<'_, SnpBacked> {
 
                 if emulate {
                     has_intercept = false;
-                    self.emulate(dev, false, entered_from_vtl, ()).await?;
+                    self.emulate(dev, interruption_pending, entered_from_vtl, ())
+                        .await?;
                     &mut self.backing.exit_stats[entered_from_vtl].npf
                 } else {
                     &mut self.backing.exit_stats[entered_from_vtl].npf_spurious
@@ -1297,30 +1461,45 @@ impl UhProcessor<'_, SnpBacked> {
             }
 
             SevExitCode::XSETBV => {
-                if let Some(value) =
-                    hardware_cvm::validate_xsetbv_exit(hardware_cvm::XsetbvExitInput {
-                        rax: vmsa.rax(),
-                        rcx: vmsa.rcx(),
-                        rdx: vmsa.rdx(),
-                        cr4: vmsa.cr4(),
-                        cpl: vmsa.cpl(),
-                    })
-                {
-                    vmsa.set_xcr0(value);
-                    advance_to_next_instruction(&mut vmsa);
-                } else {
-                    vmsa.set_event_inject(
-                        SevEventInjectInfo::new()
-                            .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_EXCEPT)
-                            .with_vector(x86defs::Exception::GENERAL_PROTECTION_FAULT.0)
-                            .with_deliver_error_code(true)
-                            .with_valid(true),
-                    );
-                }
+                self.handle_xsetbv(entered_from_vtl);
                 &mut self.backing.exit_stats[entered_from_vtl].xsetbv
             }
 
             SevExitCode::EXCP_DB => &mut self.backing.exit_stats[entered_from_vtl].excp_db,
+
+            SevExitCode::CR0_WRITE => {
+                self.handle_crx_intercept(entered_from_vtl, HvX64RegisterName::Cr0);
+                &mut self.backing.exit_stats[entered_from_vtl].secure_reg_write
+            }
+            SevExitCode::CR4_WRITE => {
+                self.handle_crx_intercept(entered_from_vtl, HvX64RegisterName::Cr4);
+                &mut self.backing.exit_stats[entered_from_vtl].secure_reg_write
+            }
+
+            tr_exit_code @ (SevExitCode::GDTR_WRITE
+            | SevExitCode::IDTR_WRITE
+            | SevExitCode::LDTR_WRITE
+            | SevExitCode::TR_WRITE) => {
+                let reg = match tr_exit_code {
+                    SevExitCode::GDTR_WRITE => HvX64RegisterName::Gdtr,
+                    SevExitCode::IDTR_WRITE => HvX64RegisterName::Idtr,
+                    SevExitCode::LDTR_WRITE => HvX64RegisterName::Ldtr,
+                    SevExitCode::TR_WRITE => HvX64RegisterName::Tr,
+                    _ => unreachable!(),
+                };
+
+                if !self.cvm_try_protect_secure_register_write(entered_from_vtl, reg, 0) {
+                    // This is an unexpected intercept: should only have received an
+                    // intercept for these registers if a VTL (i.e. VTL 1) requested
+                    // it. If an unexpected intercept has been received, then the
+                    // host must have enabled an intercept that was not desired.
+                    // Since the intercept cannot correctly be emulated, this must
+                    // be treated as a fatal error.
+                    panic!("unexpected secure register");
+                }
+
+                &mut self.backing.exit_stats[entered_from_vtl].secure_reg_write
+            }
 
             _ => {
                 debug_assert!(
@@ -1543,16 +1722,12 @@ impl<T: CpuIo> X86EmulatorSupport for UhEmulationState<'_, '_, T, SnpBacked> {
             hvdef::HV_X64_PENDING_EVENT_EXCEPTION
         );
 
-        let exception = HvX64PendingExceptionEvent::from(u128::from(event_info.reg_0));
+        let exception = HvX64PendingExceptionEvent::from(event_info.reg_0.into_bits());
+        assert!(!self.interruption_pending);
 
-        self.vp.runner.vmsa_mut(self.vtl).set_event_inject(
-            SevEventInjectInfo::new()
-                .with_valid(true)
-                .with_interruption_type(x86defs::snp::SEV_INTR_TYPE_EXCEPT)
-                .with_vector(exception.vector() as u8)
-                .with_deliver_error_code(exception.deliver_error_code())
-                .with_error_code(exception.error_code()),
-        );
+        // There's no interruption pending, so just inject the exception
+        // directly without checking for double fault.
+        SnpBacked::set_pending_exception(self.vp, self.vtl, exception);
     }
 
     fn is_gpa_mapped(&self, gpa: u64, write: bool) -> bool {
@@ -1773,6 +1948,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, SnpBacked> {
 
     fn activity(&mut self) -> Result<vp::Activity, Self::Error> {
         let lapic = &self.vp.backing.cvm.lapics[self.vtl];
+
         Ok(vp::Activity {
             mp_state: lapic.activity,
             nmi_pending: lapic.nmi_pending,
@@ -1795,6 +1971,7 @@ impl AccessVpState for UhVpStateAccess<'_, '_, SnpBacked> {
         let lapic = &mut self.vp.backing.cvm.lapics[self.vtl];
         lapic.activity = mp_state;
         lapic.nmi_pending = nmi_pending;
+
         Ok(())
     }
 

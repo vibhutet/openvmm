@@ -135,11 +135,13 @@ impl<T> SetVpRegisters for HvfHypercallHandler<'_, '_, T> {
                 HvArm64RegisterName::Sipp => self
                     .vp
                     .hv1
-                    .set_simp(&self.vp.partition.guest_memory, value.as_u64()),
+                    .set_simp(value.as_u64())
+                    .map_err(|_| (HvError::InvalidParameter, 1))?,
                 HvArm64RegisterName::Sifp => self
                     .vp
                     .hv1
-                    .set_siefp(&self.vp.partition.guest_memory, value.as_u64()),
+                    .set_siefp(value.as_u64())
+                    .map_err(|_| (HvError::InvalidParameter, 1))?,
                 HvArm64RegisterName::Scontrol => self.vp.hv1.set_scontrol(value.as_u64()),
                 HvArm64RegisterName::Eom => {}
                 r if (HvArm64RegisterName::Sint0..=HvArm64RegisterName::Sint15).contains(&r) => {

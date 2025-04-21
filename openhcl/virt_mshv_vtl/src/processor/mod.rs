@@ -24,6 +24,8 @@ cfg_if::cfg_if! {
         use virt_support_apic::LocalApic;
         use virt_support_x86emu::translate::TranslationRegisters;
         use virt::vp::AccessVpState;
+        use zerocopy::IntoBytes;
+        use hvdef::HvRegisterCrInterceptControl;
     } else if #[cfg(guest_arch = "aarch64")] {
         use hv1_hypercall::Arm64RegisterState;
         use hvdef::HvArm64RegisterName;
@@ -35,8 +37,11 @@ cfg_if::cfg_if! {
 use super::Error;
 use super::UhPartitionInner;
 use super::UhVpInner;
+use crate::ExitActivity;
 use crate::GuestVtl;
 use crate::WakeReason;
+use guestmem::GuestMemory;
+use hcl::ioctl::Hcl;
 use hcl::ioctl::ProcessorRunner;
 use hv1_emulator::message_queues::MessageQueues;
 use hv1_hypercall::HvRepResult;
@@ -103,6 +108,8 @@ pub struct UhProcessor<'a, T: Backing> {
     vtls_tlb_locked: VtlsTlbLocked,
     #[inspect(skip)]
     shared: &'a T::Shared,
+    #[inspect(with = "|x| inspect::iter_by_index(x.iter()).map_value(|a| inspect::AsHex(a.0))")]
+    exit_activities: VtlArray<ExitActivity, 2>,
 
     // Put the runner and backing at the end so that monomorphisms of functions
     // that don't access backing-specific state are more likely to be folded
@@ -242,6 +249,8 @@ mod private {
             dev: &impl CpuIo,
         ) -> Result<bool, UhRunVpError>;
 
+        fn handle_exit_activity(this: &mut UhProcessor<'_, Self>);
+
         fn handle_vp_start_enable_vtl_wake(
             _this: &mut UhProcessor<'_, Self>,
             _vtl: GuestVtl,
@@ -264,9 +273,97 @@ pub trait Backing: BackingPrivate {}
 
 impl<T: BackingPrivate> Backing for T {}
 
-pub(crate) struct BackingSharedParams {
+#[cfg_attr(not(guest_arch = "x86_64"), expect(dead_code))]
+pub(crate) struct BackingSharedParams<'a> {
     pub cvm_state: Option<crate::UhCvmPartitionState>,
+    pub guest_memory: VtlArray<GuestMemory, 2>,
+    #[cfg(guest_arch = "x86_64")]
+    pub cpuid: &'a virt::CpuidLeafSet,
+    pub hcl: &'a Hcl,
     pub guest_vsm_available: bool,
+}
+
+/// Supported intercept message types.
+#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+enum InterceptMessageType {
+    #[cfg(guest_arch = "x86_64")]
+    Register {
+        reg: HvX64RegisterName,
+        value: u64,
+    },
+    Msr {
+        msr: u32,
+    },
+}
+
+/// Per-arch state required to generate an intercept message.
+#[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
+struct InterceptMessageState {
+    instruction_length_and_cr8: u8,
+    cpl: u8,
+    efer_lma: bool,
+    cs_segment: hvdef::HvX64SegmentRegister,
+    rip: u64,
+    rflags: u64,
+    rax: u64,
+    rdx: u64,
+}
+
+impl InterceptMessageType {
+    #[cfg(guest_arch = "x86_64")]
+    fn generate_hv_message(
+        &self,
+        vp_index: VpIndex,
+        vtl: GuestVtl,
+        state: InterceptMessageState,
+    ) -> HvMessage {
+        let write_header = hvdef::HvX64InterceptMessageHeader {
+            vp_index: vp_index.index(),
+            instruction_length_and_cr8: state.instruction_length_and_cr8,
+            intercept_access_type: hvdef::HvInterceptAccessType::WRITE,
+            execution_state: hvdef::HvX64VpExecutionState::new()
+                .with_cpl(state.cpl)
+                .with_vtl(vtl.into())
+                .with_efer_lma(state.efer_lma),
+            cs_segment: state.cs_segment,
+            rip: state.rip,
+            rflags: state.rflags,
+        };
+        match self {
+            InterceptMessageType::Register { reg, value } => {
+                let intercept_message = hvdef::HvX64RegisterInterceptMessage {
+                    header: write_header,
+                    flags: hvdef::HvX64RegisterInterceptMessageFlags::new(),
+                    rsvd: 0,
+                    rsvd2: 0,
+                    register_name: *reg,
+                    access_info: hvdef::HvX64RegisterAccessInfo::new_source_value(
+                        hvdef::HvRegisterValue::from(*value),
+                    ),
+                };
+                HvMessage::new(
+                    hvdef::HvMessageType::HvMessageTypeRegisterIntercept,
+                    0,
+                    intercept_message.as_bytes(),
+                )
+            }
+            InterceptMessageType::Msr { msr } => {
+                let intercept_message = hvdef::HvX64MsrInterceptMessage {
+                    header: write_header,
+                    msr_number: *msr,
+                    rax: state.rax,
+                    rdx: state.rdx,
+                    reserved: 0,
+                };
+
+                HvMessage::new(
+                    hvdef::HvMessageType::HvMessageTypeMsrIntercept,
+                    0,
+                    intercept_message.as_bytes(),
+                )
+            }
+        }
+    }
 }
 
 /// Trait for processor backings that have hardware isolation support.
@@ -294,6 +391,33 @@ trait HardwareIsolatedBacking: Backing {
         this: &UhProcessor<'_, Self>,
         vtl: GuestVtl,
     ) -> TranslationRegisters;
+    /// Vector of the event that is pending injection into the guest state, if
+    /// valid.
+    fn pending_event_vector(this: &UhProcessor<'_, Self>, vtl: GuestVtl) -> Option<u8>;
+    /// Sets the pending exception for the guest state.
+    ///
+    /// Note that this will overwrite any existing pending exception. It will
+    /// not handle merging any existing pending exception with the new one.
+    fn set_pending_exception(
+        this: &mut UhProcessor<'_, Self>,
+        vtl: GuestVtl,
+        event: hvdef::HvX64PendingExceptionEvent,
+    );
+
+    fn intercept_message_state(
+        this: &UhProcessor<'_, Self>,
+        vtl: GuestVtl,
+    ) -> InterceptMessageState;
+
+    /// Individual register for CPUID and crx intercept handling, since
+    /// AccessVpState::registers is relatively slow on TDX.
+    fn cr0(this: &UhProcessor<'_, Self>, vtl: GuestVtl) -> u64;
+    fn cr4(this: &UhProcessor<'_, Self>, vtl: GuestVtl) -> u64;
+
+    fn cr_intercept_registration(
+        this: &mut UhProcessor<'_, Self>,
+        intercept_control: HvRegisterCrInterceptControl,
+    );
 }
 
 #[cfg_attr(guest_arch = "aarch64", expect(dead_code))]
@@ -421,8 +545,6 @@ pub enum UhRunVpError {
     UnknownVmxExit(x86defs::vmx::VmxExit),
     #[error("bad guest state on VP.ENTER")]
     VmxBadGuestState,
-    #[error("failed to access VP assist page")]
-    VpAssistPage(#[source] guestmem::GuestMemoryError),
     #[error("failed to read hypercall parameters")]
     HypercallParameters(#[source] guestmem::GuestMemoryError),
     #[error("failed to write hypercall result")]
@@ -432,6 +554,8 @@ pub enum UhRunVpError {
     /// Handling an intercept on behalf of an invalid Lower VTL
     #[error("invalid intercepted vtl {0:?}")]
     InvalidInterceptedVtl(u8),
+    #[error("access to state blocked by another vtl")]
+    StateAccessDenied,
 }
 
 /// Underhill processor run error
@@ -495,7 +619,6 @@ impl<T: Backing> UhProcessor<'_, T> {
             };
             let (ready_sints, next_ref_time) = synic.scan(
                 ref_time_now,
-                &self.partition.gm[vtl],
                 &mut self
                     .partition
                     .synic_interrupt(self.inner.vp_info.base.vp_index, vtl),
@@ -685,6 +808,8 @@ impl<'p, T: Backing> Processor for UhProcessor<'p, T> {
                         [false, false].into()
                     };
 
+                    T::handle_exit_activity(self);
+
                     if self.backing.untrusted_synic().is_some() {
                         self.update_synic(GuestVtl::Vtl0, true);
                     }
@@ -812,6 +937,7 @@ impl<'a, T: Backing> UhProcessor<'a, T> {
                 vtl1: VtlArray::new(false),
                 vtl2: VtlArray::new(false),
             },
+            exit_activities: Default::default(),
         };
 
         T::init(&mut vp);
@@ -1020,7 +1146,6 @@ impl<'a, T: Backing> UhProcessor<'a, T> {
                 if proxied_sints & (1 << sint) != 0 {
                     if let Some(synic) = self.backing.untrusted_synic_mut().as_mut() {
                         synic.post_message(
-                            &self.partition.gm[vtl],
                             sint,
                             message,
                             &mut self
@@ -1041,7 +1166,6 @@ impl<'a, T: Backing> UhProcessor<'a, T> {
                         .unwrap()
                         .synic
                         .post_message(
-                            &self.partition.gm[vtl],
                             sint,
                             message,
                             &mut self
