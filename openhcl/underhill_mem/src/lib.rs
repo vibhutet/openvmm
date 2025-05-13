@@ -534,6 +534,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             // Unaccept the pages so that the hypervisor can reclaim them.
             for &range in &ranges {
                 self.acceptor.unaccept_vtl0_pages(range);
+                self.layout.update_ram_acceptance(&range, false);
             }
         }
 
@@ -566,6 +567,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 if self.acceptor.isolation == IsolationType::Snp {
                     inner.encrypted.zero_range(range).expect("VTL 2 should have access to lower VTL memory and the page should be accepted");
                 }
+                self.layout.update_ram_acceptance(&range, true);
             }
         }
 

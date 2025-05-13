@@ -15,6 +15,7 @@ inspect = { workspace = true, optional = true }
 mesh_protobuf = { workspace = true, optional = true }
 
 thiserror.workspace = true
+parking_lot.workspace = true
 
 [lints]
 workspace = true
