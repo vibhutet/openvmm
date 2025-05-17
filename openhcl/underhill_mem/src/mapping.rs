@@ -31,6 +31,10 @@ pub struct GuestMemoryMapping {
     #[inspect(skip)]
     bitmap_lock: Mutex<()>,
     registrar: Option<MemoryRegistrar<MshvVtlWithPolicy>>,
+    #[inspect(with = "Option::is_some")]
+    acceptance_bitmap: Option<SparseMapping>,
+    #[inspect(skip)]
+    acceptance_bitmap_lock: Mutex<()>,
 }
 
 /// Error constructing a [`GuestMemoryMapping`].
@@ -174,6 +178,19 @@ impl GuestMemoryMappingBuilder {
             None
         };
 
+        let acceptance_bitmap = if self.bitmap_state.is_some() {
+            let acceptance_bitmap =
+                SparseMapping::new((address_space_size as usize / PAGE_SIZE).div_ceil(8))
+                    .map_err(MappingError::BitmapReserve)?;
+
+            acceptance_bitmap
+                .map_zero(0, acceptance_bitmap.len())
+                .map_err(MappingError::BitmapMap)?;
+            Some(acceptance_bitmap)
+        } else {
+            None
+        };
+
         // Loop through each of the memory map entries and create a mapping for it.
         for entry in memory_layout.ram() {
             if entry.range.is_empty() {
@@ -217,6 +234,32 @@ impl GuestMemoryMappingBuilder {
                     .map_err(MappingError::BitmapAlloc)?;
             }
 
+            // For simplicity, check that all the pages are 8page aligned instead of 2M aligned.
+            //As a 2nd step, for acceptance bitmap we may want to enforce 2M alignment instead.
+            // Allocate bitmap here
+            if let Some(acceptance_bitmap) = &acceptance_bitmap {
+                // To simplify bitmap implementation, require that all memory
+                // regions be 8-page aligned. Relax this if necessary.
+                if entry.range.start() % (PAGE_SIZE as u64 * 8) != 0
+                    || entry.range.end() % (PAGE_SIZE as u64 * 8) != 0
+                {
+                    return Err(MappingError::BadAlignment(entry.range));
+                }
+
+                let bitmap_start = entry.range.start() as usize / PAGE_SIZE / 8;
+                let bitmap_end = (entry.range.end() - 1) as usize / PAGE_SIZE / 8;
+                let bitmap_page_start = bitmap_start / PAGE_SIZE;
+                let bitmap_page_end = bitmap_end / PAGE_SIZE;
+                let page_count = bitmap_page_end + 1 - bitmap_page_start;
+
+                // TODO SNP: map some pre-reserved lower VTL memory into the
+                // bitmap. Or just figure out how to hot add that memory to the
+                // kernel. Or have the boot loader reserve it at boot time.
+                acceptance_bitmap
+                    .alloc(bitmap_page_start * PAGE_SIZE, page_count * PAGE_SIZE)
+                    .map_err(MappingError::BitmapAlloc)?;
+            }
+
             tracing::trace!(?entry, "mapped memory map entry");
         }
 
@@ -228,6 +271,19 @@ impl GuestMemoryMappingBuilder {
                 assert_eq!(entry.range.start() % 8, 0);
                 assert_eq!(gpn_count % 8, 0);
                 bitmap
+                    .fill_at(start_gpn as usize / 8, 0xff, gpn_count as usize / 8)
+                    .unwrap();
+            }
+        }
+
+        // Initialize bitmap to zeroes here.
+        if let Some((acceptance_bitmap, true)) = acceptance_bitmap.as_ref().zip(self.bitmap_state) {
+            for entry in memory_layout.ram() {
+                let start_gpn = entry.range.start() / PAGE_SIZE as u64;
+                let gpn_count = entry.range.len() / PAGE_SIZE as u64;
+                assert_eq!(entry.range.start() % 8, 0);
+                assert_eq!(gpn_count % 8, 0);
+                acceptance_bitmap
                     .fill_at(start_gpn as usize / 8, 0xff, gpn_count as usize / 8)
                     .unwrap();
             }
@@ -255,6 +311,8 @@ impl GuestMemoryMappingBuilder {
             bitmap,
             bitmap_lock: Default::default(),
             registrar,
+            acceptance_bitmap,
+            acceptance_bitmap_lock: Default::default(),
         })
     }
 }
@@ -276,8 +334,8 @@ impl GuestMemoryMapping {
         }
     }
 
-    pub(crate) fn check_bitmap(&self, gpn: u64) -> bool {
-        let bitmap = self.bitmap.as_ref().unwrap();
+    pub(crate) fn check_bitmap(&self, gpn: u64, main_bitmap: &Option<SparseMapping>) -> bool {
+        let bitmap = main_bitmap.as_ref().unwrap();
         let mut b = 0;
         bitmap
             .read_at(gpn as usize / 8, std::slice::from_mut(&mut b))
@@ -286,9 +344,15 @@ impl GuestMemoryMapping {
     }
 
     /// Panics if the range is outside of guest RAM.
-    pub fn update_bitmap(&self, range: MemoryRange, state: bool) {
-        let bitmap = self.bitmap.as_ref().unwrap();
-        let _lock = self.bitmap_lock.lock();
+    pub fn update_bitmap(
+        &self,
+        range: MemoryRange,
+        state: bool,
+        main_bitmap: &Option<SparseMapping>,
+        main_bitmap_lock: &Mutex,
+    ) {
+        let bitmap = main_bitmap.as_ref().unwrap();
+        let _lock = main_bitmap_lock.lock();
         for gpn in range.start() / PAGE_SIZE as u64..range.end() / PAGE_SIZE as u64 {
             // TODO: use `fill_at` for the aligned part of the range.
             let mut b = 0;
@@ -304,6 +368,27 @@ impl GuestMemoryMapping {
                 .write_at(gpn as usize / 8, std::slice::from_ref(&b))
                 .unwrap();
         }
+    }
+
+    pub fn check_shared_bitmap(&self, gpn: u64) -> bool {
+        self.check_bitmap(gpn, &self.bitmap)
+    }
+
+    pub fn check_acceptance_bitmap(&self, gpn: u64) -> bool {
+        self.check_bitmap(gpn, &self.acceptance_bitmap)
+    }
+
+    pub fn update_shared_bitmap(&self, range: MemoryRange, state: bool) {
+        self.update_bitmap(range, state, &self.bitmap, &self.bitmap_lock)
+    }
+
+    pub fn update_acceptance_bitmap(&self, range: MemoryRange, state: bool) {
+        self.update_bitmap(
+            range,
+            state,
+            &self.acceptance_bitmap,
+            &self.acceptance_bitmap_lock,
+        )
     }
 
     pub(crate) fn zero_range(

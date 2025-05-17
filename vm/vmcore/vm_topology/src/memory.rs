@@ -4,18 +4,11 @@
 //! Tools to the compute guest memory layout.
 
 use memory_range::MemoryRange;
-use parking_lot::Mutex;
-// use std::sync::Arc;
-use std::f32::consts::E;
-use std::io::Empty;
 use std::usize;
-use std::vec;
 use thiserror::Error;
 
 const PAGE_SIZE: u64 = 4096;
-const TWO_MB: u64 = 0x20_0000;
 const FOUR_GB: u64 = 0x1_0000_0000;
-const LARGE_PAGE_COUNT: u64 = TWO_MB / PAGE_SIZE;
 
 /// Represents a page-aligned byte range of memory, with additional metadata.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -26,12 +19,6 @@ pub struct MemoryRangeWithNode {
     pub range: MemoryRange,
     /// The virtual NUMA node the range belongs to.
     pub vnode: u32,
-    // Move the per range acceptance bitmap here.
-    accepted: bool,
-    #[inspect(skip)]
-    bitmap: Vec<u64>,
-    #[inspect(skip)]
-    bitmap_lock: Mutex<()>,
 }
 
 /// Describes the memory layout of a guest.
@@ -45,7 +32,6 @@ pub struct MemoryLayout {
     /// The RAM range used by VTL2. This is not present in any of the stats
     /// above.
     vtl2_range: Option<MemoryRange>,
-    // TDX TODO May be add a Overall acceptance bitmap here.?
 }
 
 #[cfg(feature = "inspect")]
@@ -116,87 +102,9 @@ fn validate_ranges_core<T>(ranges: &[T], getter: impl Fn(&T) -> &MemoryRange) ->
 }
 
 impl MemoryRangeWithNode {
-    pub fn subset_range_node_old<'a>(
-        &self,
-        left: &'a [MemoryRangeWithNode],
-        right: &[MemoryRange],
-        //) -> Result<Vec<&'a MemoryRangeWithNode>, Error> {
-    ) -> Vec<&'a MemoryRangeWithNode> {
-        let mut partial_nodes = Vec::new();
-
-        for node in left.into_iter() {
-            if let Some(_) = right
-                .into_iter()
-                .clone()
-                .find(|range| node.range.contains(range))
-            {
-                partial_nodes.push(node);
-            }
-        }
-
-        return partial_nodes;
-    }
-
-    pub fn check_subset_range_node(&self, ranges: &[MemoryRange]) -> bool {
-        if let Some(_) = ranges
-            .into_iter()
-            .clone()
-            .find(|range| self.range.contains(range))
-        {
-            return true;
-        }
-        return false;
-    }
-
-    pub fn update_acceptance_bitmap(&mut self, first_page: u64, last_page: u64, state: bool) {
-        let first_index = self.acceptance_bitmap_index(first_page);
-        let last_index = self.acceptance_bitmap_index(last_page);
-        let _lock = self.bitmap_lock.lock();
-        for index in first_index..=last_index {
-            let element = self.bitmap.get_mut(index as usize).unwrap();
-            if state {
-                *element = 1;
-            } else {
-                *element = 0;
-            }
-        }
-    }
-
-    pub fn check_acceptance_bitmap(&self, index: u64) -> bool {
-        let value = 1;
-        self.bitmap.get(index as usize).unwrap().eq(&value)
-    }
-
-    pub fn memory_acceptance_bits_required(&self, range: MemoryRange) -> u64 {
-        // let range = node.as_ptr_range();
-        let first_index = range.start_4k_gpn() / (LARGE_PAGE_COUNT);
-        let last_index = (range.end_4k_gpn() - 1) / (LARGE_PAGE_COUNT);
-        let number_of_bits = last_index + 1 - first_index;
-        assert!(first_index + number_of_bits == last_index + 1);
-        return number_of_bits;
-    }
-
-    pub fn initialize_acceptance_bitmap(&mut self) {
-        let number_of_bits = self.memory_acceptance_bits_required(self.range);
-        self.bitmap.resize(number_of_bits.try_into().unwrap(), 0);
-    }
-
-    pub fn acceptance_bitmap_index(&self, gpn: u64) -> u64 {
-        let base_index = self.range.start_4k_gpn() / LARGE_PAGE_COUNT;
-        let page_index = gpn / LARGE_PAGE_COUNT;
-        return page_index - base_index;
-    }
-
-    pub fn update_acceptance_bitmap_for_range(&mut self, range: MemoryRange, state: bool) {
-        let intersected_range = self.range.intersection(&range.clone());
-
-        if !intersected_range.is_empty() {
-            self.update_acceptance_bitmap(
-                intersected_range.start(),
-                intersected_range.end(),
-                state,
-            );
-        }
+    /// Check if atleast a part of the range is present in the node's range.
+    pub fn is_range_part_of_node(&self, range: &MemoryRange) -> bool {
+        self.range.contains_addr(range.start()) || self.range.contains_addr(range.end())
     }
 }
 
@@ -236,9 +144,6 @@ impl MemoryLayout {
             ram.push(MemoryRangeWithNode {
                 range: MemoryRange::new(last_end..last_end + this),
                 vnode: 0,
-                accepted: false,
-                bitmap: vec![0],
-                bitmap_lock: Default::default(),
             });
             remaining -= this;
             last_end = next_end;
@@ -385,13 +290,6 @@ impl MemoryLayout {
     pub fn end_of_ram_or_mmio(&self) -> u64 {
         std::cmp::max(self.mmio.last().expect("mmio set").end(), self.end_of_ram())
     }
-
-    pub fn update_ram_acceptance(&mut self, range: &MemoryRange, state: bool) {
-        self.ram
-            .iter_mut()
-            .filter(|r| r.range.overlaps(range))
-            .map(|r| r.update_acceptance_bitmap_for_range(*range, state));
-    }
 }
 
 #[cfg(test)]
@@ -413,23 +311,14 @@ mod tests {
             MemoryRangeWithNode {
                 range: MemoryRange::new(0..GB),
                 vnode: 0,
-                accepted: false,
-                bitmap: vec![0],
-                bitmap_lock: Default::default(),
             },
             MemoryRangeWithNode {
                 range: MemoryRange::new(2 * GB..3 * GB),
                 vnode: 0,
-                accepted: false,
-                bitmap: vec![0],
-                bitmap_lock: Default::default(),
             },
             MemoryRangeWithNode {
                 range: MemoryRange::new(4 * GB..TB + 2 * GB),
                 vnode: 0,
-                accepted: false,
-                bitmap: vec![0],
-                bitmap_lock: Default::default(),
             },
         ];
 
@@ -440,23 +329,14 @@ mod tests {
                 MemoryRangeWithNode {
                     range: MemoryRange::new(0..GB),
                     vnode: 0,
-                    accepted: false,
-                    bitmap: vec![0],
-                    bitmap_lock: Default::default(),
                 },
                 MemoryRangeWithNode {
                     range: MemoryRange::new(2 * GB..3 * GB),
                     vnode: 0,
-                    accepted: false,
-                    bitmap: vec![0],
-                    bitmap_lock: Default::default(),
                 },
                 MemoryRangeWithNode {
                     range: MemoryRange::new(4 * GB..TB + 2 * GB),
                     vnode: 0,
-                    accepted: false,
-                    bitmap: vec![0],
-                    bitmap_lock: Default::default(),
                 },
             ]
         );
@@ -471,23 +351,14 @@ mod tests {
                 MemoryRangeWithNode {
                     range: MemoryRange::new(0..GB),
                     vnode: 0,
-                    accepted: false,
-                    bitmap: vec![0],
-                    bitmap_lock: Default::default(),
                 },
                 MemoryRangeWithNode {
                     range: MemoryRange::new(2 * GB..3 * GB),
                     vnode: 0,
-                    accepted: false,
-                    bitmap: vec![0],
-                    bitmap_lock: Default::default(),
                 },
                 MemoryRangeWithNode {
                     range: MemoryRange::new(4 * GB..TB + 2 * GB),
                     vnode: 0,
-                    accepted: false,
-                    bitmap: vec![0],
-                    bitmap_lock: Default::default(),
                 },
             ]
         );
@@ -510,18 +381,12 @@ mod tests {
         let ram = &[MemoryRangeWithNode {
             range: MemoryRange::new(0..GB),
             vnode: 0,
-            accepted: false,
-            bitmap: vec![0],
-            bitmap_lock: Default::default(),
         }];
         MemoryLayout::new_from_ranges(ram, mmio).unwrap_err();
 
         let ram = &[MemoryRangeWithNode {
             range: MemoryRange::new(0..GB + MB),
             vnode: 0,
-            accepted: false,
-            bitmap: vec![0],
-            bitmap_lock: Default::default(),
         }];
         let mmio = &[
             MemoryRange::new(GB..2 * GB),

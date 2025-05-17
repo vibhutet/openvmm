@@ -492,7 +492,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
         let gpns = gpns
             .iter()
             .copied()
-            .filter(|&gpn| inner.shared.check_bitmap(gpn) != shared)
+            .filter(|&gpn| inner.shared.check_shared_bitmap(gpn) != shared)
             .collect::<Vec<_>>();
 
         tracing::debug!(
@@ -517,7 +517,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             &inner.shared
         };
         for &range in &ranges {
-            clear_bitmap.update_bitmap(range, false);
+            clear_bitmap.update_shared_bitmap(range, false);
         }
 
         // TODO SNP: flush concurrent accessors.
@@ -534,7 +534,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             // Unaccept the pages so that the hypervisor can reclaim them.
             for &range in &ranges {
                 self.acceptor.unaccept_vtl0_pages(range);
-                self.layout.update_ram_acceptance(&range, false);
+                clear_bitmap.update_acceptance_bitmap(range, false);
             }
         }
 
@@ -567,7 +567,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
                 if self.acceptor.isolation == IsolationType::Snp {
                     inner.encrypted.zero_range(range).expect("VTL 2 should have access to lower VTL memory and the page should be accepted");
                 }
-                self.layout.update_ram_acceptance(&range, true);
+                inner.encrypted.update_acceptance_bitmap(range, true);
             }
         }
 
@@ -578,7 +578,7 @@ impl ProtectIsolatedMemory for HardwareIsolatedMemoryProtector {
             &inner.encrypted
         };
         for &range in &ranges {
-            set_bitmap.update_bitmap(range, true);
+            set_bitmap.update_shared_bitmap(range, true);
         }
 
         if !shared {
