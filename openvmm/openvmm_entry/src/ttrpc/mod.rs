@@ -528,6 +528,7 @@ impl VmService {
                         devices,
                         io_queue_depth: None,
                         requests: Some(recv),
+                        poll_mode_queue_depth: None,
                     }
                     .into_resource(),
                 ));
