@@ -173,6 +173,7 @@ impl PetriVmmBackend for HyperVPetriBackend {
             openhcl_agent_image,
             boot_device_type,
             vmgs,
+            tpm_state_persistence,
         } = config;
 
         let PetriVmResources { driver, log_source } = resources;
@@ -573,6 +574,16 @@ impl PetriVmmBackend for HyperVPetriBackend {
 
         let mut added_controllers = Vec::new();
         let mut vtl2_settings = None;
+
+        if tpm_state_persistence {
+            vm.set_guest_state_isolation_mode(powershell::HyperVGuestStateIsolationMode::Default)
+                .await?;
+        } else {
+            vm.set_guest_state_isolation_mode(
+                powershell::HyperVGuestStateIsolationMode::NoPersistentSecrets,
+            )
+            .await?;
+        }
 
         // TODO: If OpenHCL is being used, then translate storage through it.
         // (requires changes above where VHDs are added)
