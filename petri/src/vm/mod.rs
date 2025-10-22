@@ -15,6 +15,7 @@ use crate::disk_image::AgentImage;
 use crate::openhcl_diag::OpenHclDiagHandler;
 use async_trait::async_trait;
 use get_resources::ged::FirmwareEvent;
+use hvlite_defs::config::Vtl2BaseAddressType;
 use mesh::CancelContext;
 use pal_async::DefaultDriver;
 use pal_async::task::Spawn;
@@ -474,6 +475,19 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Set the VM to use the specified processor topology.
     pub fn with_memory(mut self, memory: MemoryConfig) -> Self {
         self.config.memory = memory;
+        self
+    }
+
+    /// Sets a custom OpenHCL IGVM VTL2 address type. This controls the behavior
+    /// of where VTL2 is placed in address space, and also the total size of memory
+    /// allocated for VTL2. VTL2 start will fail if `address_type` is specified
+    /// and leads to the loader allocating less memory than what is in the IGVM file.
+    pub fn with_vtl2_base_address_type(mut self, address_type: Vtl2BaseAddressType) -> Self {
+        self.config
+            .firmware
+            .openhcl_config_mut()
+            .expect("OpenHCL firmware is required to set custom VTL2 address type.")
+            .vtl2_base_address_type = Some(address_type);
         self
     }
 
@@ -1193,6 +1207,9 @@ pub struct OpenHclConfig {
     /// from `command_line` so that petri can decide to use default log
     /// levels.
     pub log_levels: OpenHclLogConfig,
+    /// How to place VTL2 in address space. If `None`, the backend VMM
+    /// will decide on default behavior.
+    pub vtl2_base_address_type: Option<Vtl2BaseAddressType>,
 }
 
 impl OpenHclConfig {
@@ -1239,6 +1256,7 @@ impl Default for OpenHclConfig {
             vmbus_redirect: false,
             command_line: None,
             log_levels: OpenHclLogConfig::TestDefault,
+            vtl2_base_address_type: None,
         }
     }
 }

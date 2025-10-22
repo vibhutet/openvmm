@@ -467,9 +467,14 @@ impl PetriVmmBackend for HyperVPetriBackend {
                 vmbus_redirect,
                 command_line: _,
                 log_levels: _,
+                vtl2_base_address_type,
             },
         )) = &openhcl_config
         {
+            if vtl2_base_address_type.is_some() {
+                todo!("custom VTL2 base address type not yet supported for Hyper-V")
+            }
+
             // Copy the IGVM file locally, since it may not be accessible by
             // Hyper-V (e.g., if it is in a WSL filesystem).
             let igvm_file = temp_dir.path().join("igvm.bin");

@@ -184,11 +184,23 @@ impl PetriVmConfigOpenVmm {
                     framebuffer.is_some(),
                     tpm_state_persistence,
                 )?;
+
+                let late_map_vtl0_memory = match load_mode {
+                    LoadMode::Igvm {
+                        vtl2_base_address: Vtl2BaseAddressType::Vtl2Allocate { .. },
+                        ..
+                    } => {
+                        // Late Map VTL0 memory not supported when test supplies Vtl2Allocate
+                        None
+                    }
+                    _ => Some(LateMapVtl0MemoryPolicy::InjectException),
+                };
+
                 let (vtl2_vsock_listener, vtl2_vsock_path) = make_vsock_listener()?;
                 (
                     Some(Vtl2Config {
                         vtl0_alias_map: false, // TODO: enable when OpenVMM supports it for DMA
-                        late_map_vtl0_memory: Some(LateMapVtl0MemoryPolicy::InjectException),
+                        late_map_vtl0_memory,
                     }),
                     Some(VmbusConfig {
                         vsock_listener: Some(vtl2_vsock_listener),
@@ -686,6 +698,7 @@ impl PetriVmConfigSetupCore<'_> {
                     vmbus_redirect: _, // config_openhcl_vmbus_devices
                     command_line: _,
                     log_levels: _,
+                    vtl2_base_address_type,
                 } = openhcl_config;
 
                 let mut cmdline = Some(openhcl_config.command_line());
@@ -706,23 +719,28 @@ impl PetriVmConfigSetupCore<'_> {
                     Firmware::OpenhclUefi { isolation, .. } if isolation.is_some() => true,
                     _ => false,
                 };
+
+                let vtl2_base_address = vtl2_base_address_type.unwrap_or_else(|| {
+                    if isolated {
+                        // Isolated VMs must load at the location specified by
+                        // the file, as they do not support relocation.
+                        Vtl2BaseAddressType::File
+                    } else {
+                        // By default, utilize IGVM relocation and tell OpenVMM
+                        // to place VTL2 at 2GB. This tests both relocation
+                        // support in OpenVMM, and relocation support within
+                        // OpenHCL.
+                        Vtl2BaseAddressType::Absolute(2 * SIZE_1_GB)
+                    }
+                });
+
                 let file = File::open(igvm_path.clone())
                     .context("failed to open openhcl firmware file")?
                     .into();
                 LoadMode::Igvm {
                     file,
                     cmdline: cmdline.unwrap_or_default(),
-                    vtl2_base_address: if isolated {
-                        // Isolated VMs must load at the location specified by
-                        // the file, as they do not support relocation.
-                        Vtl2BaseAddressType::File
-                    } else {
-                        // By default, utilize IGVM relocation and tell hvlite
-                        // to place VTL2 at 2GB. This tests both relocation
-                        // support in hvlite, and relocation support within
-                        // underhill.
-                        Vtl2BaseAddressType::Absolute(2 * SIZE_1_GB)
-                    },
+                    vtl2_base_address,
                     com_serial: Some(SerialInformation {
                         io_port: ComPort::Com3.io_port(),
                         irq: ComPort::Com3.irq().into(),
