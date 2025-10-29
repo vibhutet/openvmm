@@ -2012,6 +2012,7 @@ impl InitializedVm {
                         &mut mmio,
                         vmbus.control().as_ref(),
                         interrupt_mapper,
+                        None,
                     )
                     .await?;
 
@@ -2126,6 +2127,7 @@ impl InitializedVm {
                                 hv_device.clone().interrupt_mapper(),
                             ))
                         },
+                        None,
                     )
                     .await?;
                 }
@@ -2170,6 +2172,7 @@ impl InitializedVm {
                                 &mut services.register_mmio(),
                                 vmbus,
                                 crate::partition::VpciDevice::interrupt_mapper(hv_device),
+                                None,
                             )
                             .await
                         })
