@@ -469,6 +469,7 @@ struct QueueStats {
     tx_packets: Counter,
     tx_lso_packets: Counter,
     tx_checksum_packets: Counter,
+    tx_invalid_lso_packets: Counter,
     tx_packets_per_wake: Histogram<10>,
     rx_packets_per_wake: Histogram<10>,
 }
@@ -764,16 +765,14 @@ impl OffloadConfig {
 
         let lso_v2 = {
             let mut lso = rndisprot::TcpLargeSendOffloadV2::new_zeroed();
-            // Use the same maximum as vmswitch.
-            const MAX_OFFLOAD_SIZE: u32 = 0xF53C;
             if self.lso4 {
                 lso.ipv4_encapsulation = rndisprot::NDIS_ENCAPSULATION_IEEE_802_3;
-                lso.ipv4_max_offload_size = MAX_OFFLOAD_SIZE;
+                lso.ipv4_max_offload_size = rndisprot::LSO_MAX_OFFLOAD_SIZE;
                 lso.ipv4_min_segment_count = rndisprot::LSO_MIN_SEGMENT_COUNT;
             }
             if self.lso6 {
                 lso.ipv6_encapsulation = rndisprot::NDIS_ENCAPSULATION_IEEE_802_3;
-                lso.ipv6_max_offload_size = MAX_OFFLOAD_SIZE;
+                lso.ipv6_max_offload_size = rndisprot::LSO_MAX_OFFLOAD_SIZE;
                 lso.ipv6_min_segment_count = rndisprot::LSO_MIN_SEGMENT_COUNT;
                 lso.ipv6_flags = rndisprot::Ipv6LsoFlags::new()
                     .with_ip_extension_headers_supported(rndisprot::NDIS_OFFLOAD_SUPPORTED)
@@ -1909,8 +1908,6 @@ enum WorkerError {
     RndisMessageTooSmall,
     #[error("unsupported rndis behavior")]
     UnsupportedRndisBehavior,
-    #[error("invalid lso packet with insufficient segments: {0}")]
-    InvalidLsoPacketInsufficientSegments(u32),
     #[error("vmbus queue error")]
     Queue(#[from] queue::Error),
     #[error("too many control messages")]
@@ -2492,6 +2489,11 @@ impl<T: RingMem> NetChannel<T> {
                             (b >> 4) * 4
                         };
                         metadata.max_tcp_segment_size = n.mss() as u16;
+
+                        if request.data_length >= rndisprot::LSO_MAX_OFFLOAD_SIZE {
+                            // Not strictly enforced.
+                            stats.tx_invalid_lso_packets.increment();
+                        }
                     }
                     _ => {}
                 }
@@ -2510,13 +2512,6 @@ impl<T: RingMem> NetChannel<T> {
         }
 
         metadata.segment_count = (segments.len() - start) as u8;
-        if metadata.flags.offload_tcp_segmentation()
-            && (metadata.segment_count as u32) < rndisprot::LSO_MIN_SEGMENT_COUNT
-        {
-            return Err(WorkerError::InvalidLsoPacketInsufficientSegments(
-                segments.len() as u32,
-            ));
-        }
 
         stats.tx_packets.increment();
         if metadata.flags.offload_tcp_checksum() || metadata.flags.offload_udp_checksum() {
