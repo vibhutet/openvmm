@@ -154,6 +154,9 @@ pub trait PetriVmmBackend {
     /// Select backend specific quirks guest and vmm quirks.
     fn quirks(firmware: &Firmware) -> (GuestQuirksInner, VmmQuirks);
 
+    /// Get the default servicing flags (based on what this backend supports)
+    fn default_servicing_flags() -> OpenHclServicingFlags;
+
     /// Resolve any artifacts needed to use this backend
     fn new(resolver: &ArtifactResolver<'_>) -> Self;
 
@@ -696,6 +699,11 @@ impl<T: PetriVmmBackend> PetriVmBuilder<T> {
     /// Get the machine architecture
     pub fn arch(&self) -> MachineArch {
         self.config.arch
+    }
+
+    /// Get the default OpenHCL servicing flags for this config
+    pub fn default_servicing_flags(&self) -> OpenHclServicingFlags {
+        T::default_servicing_flags()
     }
 
     /// Get the backend-specific config builder
@@ -1729,9 +1737,10 @@ pub enum IsolationType {
 }
 
 /// Flags controlling servicing behavior.
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct OpenHclServicingFlags {
     /// Preserve DMA memory for NVMe devices if supported.
+    /// Defaults to `true`.
     pub enable_nvme_keepalive: bool,
     /// Skip any logic that the vmm may have to ignore servicing updates if the supplied igvm file version is not different than the one currently running.
     pub override_version_checks: bool,
